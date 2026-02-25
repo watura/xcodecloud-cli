@@ -15,7 +15,7 @@ pub fn workflowsForProduct(allocator: Allocator, product_id: []const u8) ![]u8 {
 pub fn buildRunsForWorkflow(allocator: Allocator, workflow_id: []const u8) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
-        "/v1/ciWorkflows/{s}/buildRuns?include=sourceBranchOrTag&limit=50",
+        "/v1/ciWorkflows/{s}/buildRuns?include=sourceBranchOrTag&sort=-number&limit=50",
         .{workflow_id},
     );
 }
