@@ -412,3 +412,53 @@ fn lookupIncludedRefName(
     }
     return null;
 }
+
+test "parseArtifacts parses fields" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{
+        \\  "data": [
+        \\    {
+        \\      "id": "artifact-1",
+        \\      "attributes": {
+        \\        "fileName": "build.log",
+        \\        "fileType": "LOG",
+        \\        "downloadUrl": "https://example.com/build.log"
+        \\      }
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    const artifacts = try parseArtifacts(allocator, body);
+    defer freeArtifacts(allocator, artifacts);
+
+    try std.testing.expectEqual(@as(usize, 1), artifacts.len);
+    try std.testing.expectEqualStrings("artifact-1", artifacts[0].id);
+    try std.testing.expectEqualStrings("build.log", artifacts[0].file_name);
+    try std.testing.expectEqualStrings("LOG", artifacts[0].file_type);
+    try std.testing.expectEqualStrings("https://example.com/build.log", artifacts[0].download_url);
+}
+
+test "parseArtifacts fills defaults when attributes are missing" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{
+        \\  "data": [
+        \\    {
+        \\      "id": "artifact-2",
+        \\      "attributes": {}
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    const artifacts = try parseArtifacts(allocator, body);
+    defer freeArtifacts(allocator, artifacts);
+
+    try std.testing.expectEqual(@as(usize, 1), artifacts.len);
+    try std.testing.expectEqualStrings("artifact-2", artifacts[0].id);
+    try std.testing.expectEqualStrings("(no file name)", artifacts[0].file_name);
+    try std.testing.expectEqualStrings("-", artifacts[0].file_type);
+    try std.testing.expectEqualStrings("-", artifacts[0].download_url);
+}

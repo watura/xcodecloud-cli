@@ -140,6 +140,7 @@ pub const App = struct {
             .workflows => {
                 const changed = self.refreshWorkflowsIfChanged() catch |err| {
                     try self.setStatusFmt("Polling failed: {s}", .{@errorName(err)});
+                    ctx.consumeAndRedraw();
                     return;
                 };
                 if (changed) {
@@ -150,6 +151,7 @@ pub const App = struct {
             .build_runs => {
                 const changed = self.refreshBuildRunsIfChanged() catch |err| {
                     try self.setStatusFmt("Polling failed: {s}", .{@errorName(err)});
+                    ctx.consumeAndRedraw();
                     return;
                 };
                 if (changed) {
@@ -536,10 +538,14 @@ pub const App = struct {
         child.stdin_behavior = .Ignore;
         child.stdout_behavior = .Ignore;
         child.stderr_behavior = .Ignore;
-        _ = child.spawnAndWait() catch {
+        const term = child.spawnAndWait() catch {
             try self.setStatusFmt("Failed to open URL: {s}", .{artifact.download_url});
             return;
         };
+        if (term.Exited != 0) {
+            try self.setStatusFmt("Failed to open URL: {s}", .{artifact.download_url});
+            return;
+        }
 
         try self.setStatusFmt("Opened URL: {s}", .{artifact.download_url});
     }
