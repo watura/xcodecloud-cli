@@ -1,0 +1,19 @@
+.{
+    .name = .istanbul_v1,
+    .version = "0.1.0",
+    .fingerprint = 0x7d421c1cc2d7219a,
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        .vaxis = .{
+            .url = "git+https://github.com/rockorager/libvaxis?ref=main#67bbc1ee072aa390838c66caf4ed47edee282dc4",
+            .hash = "vaxis-0.5.1-BWNV_IxJCQC5OGNaXQfNnqgn9_Vku0PMgey-dplubcQK",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        ".tool-versions",
+        "README.md",
+        "src",
+    },
+}

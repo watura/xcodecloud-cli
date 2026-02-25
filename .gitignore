@@ -1,5 +1,6 @@
 # ---> Zig
 zig-cache/
+.zig-cache/
 zig-out/
 build/
 build-*/
@@ -31,4 +32,3 @@ Icon
 Network Trash Folder
 Temporary Items
 .apdisk
-
