@@ -32,6 +32,10 @@ pub fn buildActionsForRun(allocator: Allocator, build_run_id: []const u8) ![]u8 
     return std.fmt.allocPrint(allocator, "/v1/ciBuildRuns/{s}/actions", .{build_run_id});
 }
 
+pub fn artifactsForAction(allocator: Allocator, action_id: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "/v1/ciBuildActions/{s}/artifacts", .{action_id});
+}
+
 pub fn createBuildRunPayload(allocator: Allocator, workflow_id: []const u8) ![]u8 {
     return std.fmt.allocPrint(
         allocator,

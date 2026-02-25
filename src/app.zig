@@ -8,15 +8,18 @@ const products_view = @import("views/products.zig");
 const workflows_view = @import("views/workflows.zig");
 const build_runs_view = @import("views/build_runs.zig");
 const build_run_detail_view = @import("views/build_run_detail.zig");
+const build_action_artifacts_view = @import("views/build_action_artifacts.zig");
 const status_bar = @import("widgets/status_bar.zig");
 
 const Allocator = std.mem.Allocator;
+const poll_interval_ms: u32 = 30_000;
 
 pub const Screen = enum {
     products,
     workflows,
     build_runs,
     build_run_detail,
+    build_action_artifacts,
 };
 
 const RowEntry = struct {
@@ -42,10 +45,12 @@ pub const App = struct {
     build_runs: []types.CiBuildRun = &.{},
     build_run_detail: ?types.CiBuildRun = null,
     build_actions: []types.CiBuildAction = &.{},
+    build_action_artifacts: []types.CiArtifact = &.{},
 
     selected_product_index: usize = 0,
     selected_workflow_index: usize = 0,
     selected_build_run_index: usize = 0,
+    selected_build_action_index: usize = 0,
 
     status_message: ?[]u8 = null,
 
@@ -78,6 +83,7 @@ pub const App = struct {
         self.clearWorkflows();
         self.clearBuildRuns();
         self.clearBuildActions();
+        self.clearBuildActionArtifacts();
         self.clearBuildRunDetail();
 
         if (self.status_message) |message| {
@@ -113,9 +119,44 @@ pub const App = struct {
         switch (event) {
             .init => {
                 try self.reloadCurrentScreen();
+                try self.scheduleNextPoll(ctx);
                 ctx.consumeAndRedraw();
             },
+            .tick => {
+                try self.pollScreenAndNotify(ctx);
+                try self.scheduleNextPoll(ctx);
+            },
             .key_press => |key| try self.handleKeyPress(ctx, key),
+            else => {},
+        }
+    }
+
+    fn scheduleNextPoll(self: *App, ctx: *vxfw.EventContext) !void {
+        try ctx.tick(poll_interval_ms, self.widget());
+    }
+
+    fn pollScreenAndNotify(self: *App, ctx: *vxfw.EventContext) !void {
+        switch (self.screen) {
+            .workflows => {
+                const changed = self.refreshWorkflowsIfChanged() catch |err| {
+                    try self.setStatusFmt("Polling failed: {s}", .{@errorName(err)});
+                    return;
+                };
+                if (changed) {
+                    try ctx.sendNotification("Xcode Cloud", "Workflows list updated");
+                    ctx.consumeAndRedraw();
+                }
+            },
+            .build_runs => {
+                const changed = self.refreshBuildRunsIfChanged() catch |err| {
+                    try self.setStatusFmt("Polling failed: {s}", .{@errorName(err)});
+                    return;
+                };
+                if (changed) {
+                    try ctx.sendNotification("Xcode Cloud", "Build runs updated");
+                    ctx.consumeAndRedraw();
+                }
+            },
             else => {},
         }
     }
@@ -172,6 +213,12 @@ pub const App = struct {
             ctx.consumeAndRedraw();
             return;
         }
+
+        if (key.matches('d', .{}) and self.screen == .build_action_artifacts) {
+            try self.downloadSelectedArtifact();
+            ctx.consumeAndRedraw();
+            return;
+        }
     }
 
     fn draw(self: *App, ctx: vxfw.DrawContext) Allocator.Error!vxfw.Surface {
@@ -184,7 +231,12 @@ pub const App = struct {
         else
             try std.fmt.allocPrint(ctx.arena, "{s}\n{s}", .{ breadcrumb, info });
 
-        const hints = try status_bar.line(ctx.arena, self.screen != .products, self.screen == .build_runs);
+        const hints = try status_bar.line(
+            ctx.arena,
+            self.screen != .products,
+            self.screen == .build_runs,
+            self.screen == .build_action_artifacts,
+        );
 
         const title_text: vxfw.Text = .{
             .text = title_block,
@@ -250,7 +302,14 @@ pub const App = struct {
                 self.selected_build_run_index = self.cursorIndex();
                 try self.loadBuildRunDetail();
             },
-            .build_run_detail => {},
+            .build_run_detail => {
+                if (self.build_actions.len == 0) return;
+                self.selected_build_action_index = self.cursorIndex();
+                try self.loadBuildActionArtifacts();
+            },
+            .build_action_artifacts => {
+                try self.openSelectedArtifactUrl();
+            },
         }
     }
 
@@ -269,6 +328,10 @@ pub const App = struct {
                 self.screen = .build_runs;
                 try self.rebuildRows(self.selected_build_run_index);
             },
+            .build_action_artifacts => {
+                self.screen = .build_run_detail;
+                try self.rebuildRows(self.selected_build_action_index);
+            },
         }
     }
 
@@ -278,6 +341,7 @@ pub const App = struct {
             .workflows => try self.loadWorkflows(),
             .build_runs => try self.loadBuildRuns(),
             .build_run_detail => try self.loadBuildRunDetail(),
+            .build_action_artifacts => try self.loadBuildActionArtifacts(),
         }
     }
 
@@ -315,6 +379,29 @@ pub const App = struct {
         try self.setStatusFmt("Loaded {d} workflows for {s}", .{ self.workflows.len, product.name });
     }
 
+    fn refreshWorkflowsIfChanged(self: *App) !bool {
+        if (self.products.len == 0) return false;
+        self.selected_product_index = @min(self.selected_product_index, self.products.len - 1);
+        const product = self.products[self.selected_product_index];
+
+        const latest = try self.api.listWorkflows(product.id);
+        errdefer types.freeWorkflows(self.allocator, latest);
+
+        if (workflowsEqual(self.workflows, latest)) {
+            types.freeWorkflows(self.allocator, latest);
+            return false;
+        }
+
+        self.clearWorkflows();
+        self.workflows = latest;
+        if (self.selected_workflow_index >= self.workflows.len) {
+            self.selected_workflow_index = 0;
+        }
+        try self.rebuildRows(self.selected_workflow_index);
+        try self.setStatusFmt("Updated workflows for {s}", .{product.name});
+        return true;
+    }
+
     fn loadBuildRuns(self: *App) !void {
         if (self.workflows.len == 0) {
             try self.setStatus("No workflows available");
@@ -335,6 +422,30 @@ pub const App = struct {
 
         try self.rebuildRows(self.selected_build_run_index);
         try self.setStatusFmt("Loaded {d} build runs for {s}", .{ self.build_runs.len, workflow.name });
+    }
+
+    fn refreshBuildRunsIfChanged(self: *App) !bool {
+        if (self.workflows.len == 0) return false;
+        self.selected_workflow_index = @min(self.selected_workflow_index, self.workflows.len - 1);
+        const workflow = self.workflows[self.selected_workflow_index];
+
+        const latest = try self.api.listBuildRuns(workflow.id);
+        errdefer types.freeBuildRuns(self.allocator, latest);
+        std.mem.sort(types.CiBuildRun, latest, {}, lessThanBuildRunNewestFirst);
+
+        if (buildRunsEqual(self.build_runs, latest)) {
+            types.freeBuildRuns(self.allocator, latest);
+            return false;
+        }
+
+        self.clearBuildRuns();
+        self.build_runs = latest;
+        if (self.selected_build_run_index >= self.build_runs.len) {
+            self.selected_build_run_index = 0;
+        }
+        try self.rebuildRows(self.selected_build_run_index);
+        try self.setStatusFmt("Updated build runs for {s}", .{workflow.name});
+        return true;
     }
 
     fn lessThanBuildRunNewestFirst(_: void, lhs: types.CiBuildRun, rhs: types.CiBuildRun) bool {
@@ -365,6 +476,7 @@ pub const App = struct {
 
         self.clearBuildRunDetail();
         self.clearBuildActions();
+        self.clearBuildActionArtifacts();
 
         self.build_run_detail = try self.api.getBuildRun(run.id);
         self.build_actions = try self.api.listBuildActions(run.id);
@@ -372,6 +484,64 @@ pub const App = struct {
 
         try self.rebuildRows(0);
         try self.setStatusFmt("Loaded details for build run #{s}", .{run.number});
+    }
+
+    fn loadBuildActionArtifacts(self: *App) !void {
+        if (self.build_actions.len == 0) {
+            try self.setStatus("No build actions available");
+            return;
+        }
+
+        self.selected_build_action_index = @min(self.selected_build_action_index, self.build_actions.len - 1);
+        const action = self.build_actions[self.selected_build_action_index];
+
+        self.clearBuildActionArtifacts();
+        self.build_action_artifacts = try self.api.listArtifactsForAction(action.id);
+        self.screen = .build_action_artifacts;
+
+        try self.rebuildRows(0);
+        try self.setStatusFmt("Loaded {d} artifacts for action {s}", .{ self.build_action_artifacts.len, action.name });
+    }
+
+    fn downloadSelectedArtifact(self: *App) !void {
+        if (self.build_action_artifacts.len == 0) {
+            try self.setStatus("No artifacts available");
+            return;
+        }
+        const idx = self.cursorIndex();
+        const artifact = self.build_action_artifacts[@min(idx, self.build_action_artifacts.len - 1)];
+        const saved_path = try self.api.downloadArtifact(artifact);
+        defer self.allocator.free(saved_path);
+        try self.setStatusFmt("Downloaded: {s}", .{saved_path});
+    }
+
+    fn openSelectedArtifactUrl(self: *App) !void {
+        if (self.build_action_artifacts.len == 0) {
+            try self.setStatus("No artifacts available");
+            return;
+        }
+        const idx = self.cursorIndex();
+        const artifact = self.build_action_artifacts[@min(idx, self.build_action_artifacts.len - 1)];
+        if (std.mem.eql(u8, artifact.download_url, "-")) {
+            try self.setStatus("No download URL for selected artifact");
+            return;
+        }
+
+        const argv = if (@import("builtin").os.tag == .macos)
+            [_][]const u8{ "open", artifact.download_url }
+        else
+            [_][]const u8{ "xdg-open", artifact.download_url };
+
+        var child = std.process.Child.init(&argv, self.allocator);
+        child.stdin_behavior = .Ignore;
+        child.stdout_behavior = .Ignore;
+        child.stderr_behavior = .Ignore;
+        _ = child.spawnAndWait() catch {
+            try self.setStatusFmt("Failed to open URL: {s}", .{artifact.download_url});
+            return;
+        };
+
+        try self.setStatusFmt("Opened URL: {s}", .{artifact.download_url});
     }
 
     fn triggerBuild(self: *App) !void {
@@ -438,6 +608,16 @@ pub const App = struct {
                     self.row_entries[idx] = makeRowEntry(line);
                 }
             },
+            .build_action_artifacts => {
+                const action_name = if (self.build_actions.len == 0) "-" else self.build_actions[self.selected_build_action_index].name;
+                self.title_line = try std.fmt.allocPrint(arena, "Artifacts for {s}", .{action_name});
+                self.header_line = try build_action_artifacts_view.artifactHeader(arena);
+                self.row_entries = try arena.alloc(RowEntry, self.build_action_artifacts.len);
+                for (self.build_action_artifacts, 0..) |item, idx| {
+                    const line = try build_action_artifacts_view.artifactRow(arena, item);
+                    self.row_entries[idx] = makeRowEntry(line);
+                }
+            },
         }
 
         self.resetListView(cursor);
@@ -465,6 +645,7 @@ pub const App = struct {
             .workflows => std.fmt.allocPrint(allocator, "Xcode Cloud > Products > {s}", .{self.titleLine()}),
             .build_runs => std.fmt.allocPrint(allocator, "Xcode Cloud > Products > Workflows > {s}", .{self.titleLine()}),
             .build_run_detail => std.fmt.allocPrint(allocator, "Xcode Cloud > Products > Workflows > Build Runs > Detail", .{}),
+            .build_action_artifacts => std.fmt.allocPrint(allocator, "Xcode Cloud > Products > Workflows > Build Runs > Detail > Artifacts", .{}),
         };
     }
 
@@ -475,6 +656,7 @@ pub const App = struct {
             .workflows => "Workflows",
             .build_runs => "Build Runs",
             .build_run_detail => "Build Run Detail",
+            .build_action_artifacts => "Build Action Artifacts",
         };
     }
 
@@ -549,6 +731,13 @@ pub const App = struct {
         }
     }
 
+    fn clearBuildActionArtifacts(self: *App) void {
+        if (self.build_action_artifacts.len > 0) {
+            types.freeArtifacts(self.allocator, self.build_action_artifacts);
+            self.build_action_artifacts = &.{};
+        }
+    }
+
     fn clearBuildRunDetail(self: *App) void {
         if (self.build_run_detail) |detail| {
             types.freeBuildRun(self.allocator, detail);
@@ -556,3 +745,28 @@ pub const App = struct {
         }
     }
 };
+
+fn workflowsEqual(a: []const types.CiWorkflow, b: []const types.CiWorkflow) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |lhs, rhs| {
+        if (!std.mem.eql(u8, lhs.id, rhs.id)) return false;
+        if (!std.mem.eql(u8, lhs.name, rhs.name)) return false;
+        if (lhs.is_enabled != rhs.is_enabled) return false;
+    }
+    return true;
+}
+
+fn buildRunsEqual(a: []const types.CiBuildRun, b: []const types.CiBuildRun) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |lhs, rhs| {
+        if (!std.mem.eql(u8, lhs.id, rhs.id)) return false;
+        if (!std.mem.eql(u8, lhs.number, rhs.number)) return false;
+        if (!std.mem.eql(u8, lhs.source_branch_or_tag, rhs.source_branch_or_tag)) return false;
+        if (!std.mem.eql(u8, lhs.status, rhs.status)) return false;
+        if (!std.mem.eql(u8, lhs.completion_status, rhs.completion_status)) return false;
+        if (!std.mem.eql(u8, lhs.created_date, rhs.created_date)) return false;
+        if (!std.mem.eql(u8, lhs.started_date, rhs.started_date)) return false;
+        if (!std.mem.eql(u8, lhs.finished_date, rhs.finished_date)) return false;
+    }
+    return true;
+}

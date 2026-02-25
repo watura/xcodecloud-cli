@@ -34,6 +34,13 @@ pub const CiBuildAction = struct {
     finished_date: []u8,
 };
 
+pub const CiArtifact = struct {
+    id: []u8,
+    file_name: []u8,
+    file_type: []u8,
+    download_url: []u8,
+};
+
 const AppRelationship = struct {
     data: ?struct {
         id: []const u8,
@@ -88,6 +95,16 @@ pub fn freeBuildActions(allocator: Allocator, items: []CiBuildAction) void {
         allocator.free(item.status);
         allocator.free(item.started_date);
         allocator.free(item.finished_date);
+    }
+    allocator.free(items);
+}
+
+pub fn freeArtifacts(allocator: Allocator, items: []CiArtifact) void {
+    for (items) |item| {
+        allocator.free(item.id);
+        allocator.free(item.file_name);
+        allocator.free(item.file_type);
+        allocator.free(item.download_url);
     }
     allocator.free(items);
 }
@@ -258,6 +275,46 @@ pub fn parseBuildActions(allocator: Allocator, json_body: []const u8) ![]CiBuild
             .status = try dupOrDefault(allocator, status_value, "-"),
             .started_date = try dupOrDefault(allocator, raw.attributes.startedDate, "-"),
             .finished_date = try dupOrDefault(allocator, raw.attributes.finishedDate, "-"),
+        });
+    }
+
+    return list.toOwnedSlice(allocator);
+}
+
+pub fn parseArtifacts(allocator: Allocator, json_body: []const u8) ![]CiArtifact {
+    const Response = struct {
+        data: []const struct {
+            id: []const u8,
+            attributes: struct {
+                fileName: ?[]const u8 = null,
+                fileType: ?[]const u8 = null,
+                downloadUrl: ?[]const u8 = null,
+            } = .{},
+        },
+    };
+
+    var parsed = try std.json.parseFromSlice(Response, allocator, json_body, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    var list: std.ArrayListUnmanaged(CiArtifact) = .empty;
+    errdefer {
+        for (list.items) |item| {
+            allocator.free(item.id);
+            allocator.free(item.file_name);
+            allocator.free(item.file_type);
+            allocator.free(item.download_url);
+        }
+        list.deinit(allocator);
+    }
+
+    for (parsed.value.data) |raw| {
+        try list.append(allocator, .{
+            .id = try allocator.dupe(u8, raw.id),
+            .file_name = try dupOrDefault(allocator, raw.attributes.fileName, "(no file name)"),
+            .file_type = try dupOrDefault(allocator, raw.attributes.fileType, "-"),
+            .download_url = try dupOrDefault(allocator, raw.attributes.downloadUrl, "-"),
         });
     }
 

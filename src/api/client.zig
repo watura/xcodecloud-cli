@@ -116,6 +116,51 @@ pub const Client = struct {
         return types.parseBuildActions(self.allocator, body);
     }
 
+    pub fn listArtifactsForAction(self: *Client, action_id: []const u8) ![]types.CiArtifact {
+        if (self.credentials == null) return mockArtifactsForAction(self.allocator, action_id);
+
+        const path = try endpoints.artifactsForAction(self.allocator, action_id);
+        defer self.allocator.free(path);
+
+        const body = try self.requestJson(.GET, path, null);
+        defer self.allocator.free(body);
+
+        return types.parseArtifacts(self.allocator, body);
+    }
+
+    pub fn downloadArtifact(self: *Client, artifact: types.CiArtifact) ![]u8 {
+        try std.fs.cwd().makePath("downloads");
+
+        const safe_name = try sanitizeFileNameAlloc(self.allocator, artifact.file_name);
+        defer self.allocator.free(safe_name);
+
+        const out_path = try std.fmt.allocPrint(self.allocator, "downloads/{s}", .{safe_name});
+        errdefer self.allocator.free(out_path);
+
+        if (std.mem.startsWith(u8, artifact.download_url, "mock://")) {
+            var file = try std.fs.cwd().createFile(out_path, .{ .truncate = true });
+            defer file.close();
+            try file.writeAll("mock artifact content\n");
+            return out_path;
+        }
+
+        var sink: std.Io.Writer.Allocating = .init(self.allocator);
+        defer sink.deinit();
+
+        const result = try self.http.fetch(.{
+            .location = .{ .url = artifact.download_url },
+            .method = .GET,
+            .response_writer = &sink.writer,
+        });
+        if (result.status.class() != .success) return error.HttpRequestFailed;
+
+        var file = try std.fs.cwd().createFile(out_path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(sink.written());
+
+        return out_path;
+    }
+
     fn requestJson(
         self: *Client,
         method: std.http.Method,
@@ -338,4 +383,41 @@ fn mockAction(
         .started_date = try allocator.dupe(u8, started),
         .finished_date = try allocator.dupe(u8, finished),
     };
+}
+
+fn mockArtifactsForAction(allocator: Allocator, action_id: []const u8) ![]types.CiArtifact {
+    const items = try allocator.alloc(types.CiArtifact, 2);
+    errdefer allocator.free(items);
+
+    items[0] = .{
+        .id = try allocator.dupe(u8, "artifact-log"),
+        .file_name = try allocator.dupe(u8, "build.log"),
+        .file_type = try allocator.dupe(u8, "LOG"),
+        .download_url = try std.fmt.allocPrint(allocator, "mock://{s}/build.log", .{action_id}),
+    };
+    items[1] = .{
+        .id = try allocator.dupe(u8, "artifact-xcresult"),
+        .file_name = try allocator.dupe(u8, "result.xcresult"),
+        .file_type = try allocator.dupe(u8, "XCODE_RESULT_BUNDLE"),
+        .download_url = try std.fmt.allocPrint(allocator, "mock://{s}/result.xcresult", .{action_id}),
+    };
+    return items;
+}
+
+fn sanitizeFileNameAlloc(allocator: Allocator, raw: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+
+    for (raw) |c| {
+        const safe = switch (c) {
+            '/', '\\', ':', '*', '?', '"', '<', '>', '|', 0 => '_',
+            else => c,
+        };
+        try out.append(allocator, safe);
+    }
+
+    if (out.items.len == 0) {
+        try out.appendSlice(allocator, "artifact.bin");
+    }
+    return out.toOwnedSlice(allocator);
 }
