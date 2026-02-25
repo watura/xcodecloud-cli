@@ -1,0 +1,558 @@
+const std = @import("std");
+const vaxis = @import("vaxis");
+const vxfw = vaxis.vxfw;
+
+const api_client = @import("api/client.zig");
+const types = @import("api/types.zig");
+const products_view = @import("views/products.zig");
+const workflows_view = @import("views/workflows.zig");
+const build_runs_view = @import("views/build_runs.zig");
+const build_run_detail_view = @import("views/build_run_detail.zig");
+const status_bar = @import("widgets/status_bar.zig");
+
+const Allocator = std.mem.Allocator;
+
+pub const Screen = enum {
+    products,
+    workflows,
+    build_runs,
+    build_run_detail,
+};
+
+const RowEntry = struct {
+    line: []const u8,
+    text: vxfw.Text,
+};
+
+pub const App = struct {
+    allocator: Allocator,
+    api: *api_client.Client,
+
+    screen: Screen = .products,
+    list_view: vxfw.ListView,
+
+    rows_arena: std.heap.ArenaAllocator,
+    row_entries: []RowEntry = &.{},
+    title_line: []const u8 = "",
+    header_line: []const u8 = "",
+    detail_summary: []const u8 = "",
+
+    products: []types.CiProduct = &.{},
+    workflows: []types.CiWorkflow = &.{},
+    build_runs: []types.CiBuildRun = &.{},
+    build_run_detail: ?types.CiBuildRun = null,
+    build_actions: []types.CiBuildAction = &.{},
+
+    selected_product_index: usize = 0,
+    selected_workflow_index: usize = 0,
+    selected_build_run_index: usize = 0,
+
+    status_message: ?[]u8 = null,
+
+    pub fn init(allocator: Allocator, api: *api_client.Client) !App {
+        var app = App{
+            .allocator = allocator,
+            .api = api,
+            .screen = .products,
+            .list_view = .{
+                .children = .{ .builder = .{ .userdata = undefined, .buildFn = App.buildRow } },
+                .draw_cursor = false,
+                .item_count = 0,
+            },
+            .rows_arena = std.heap.ArenaAllocator.init(allocator),
+        };
+
+        app.list_view.children = .{ .builder = .{ .userdata = &app, .buildFn = App.buildRow } };
+
+        if (api.authWarning()) |warning| {
+            try app.setStatus(warning);
+        } else {
+            try app.setStatus("Ready");
+        }
+
+        return app;
+    }
+
+    pub fn deinit(self: *App) void {
+        self.clearProducts();
+        self.clearWorkflows();
+        self.clearBuildRuns();
+        self.clearBuildActions();
+        self.clearBuildRunDetail();
+
+        if (self.status_message) |message| {
+            self.allocator.free(message);
+            self.status_message = null;
+        }
+
+        self.rows_arena.deinit();
+    }
+
+    pub fn widget(self: *App) vxfw.Widget {
+        return .{
+            .userdata = self,
+            .eventHandler = typeErasedEventHandler,
+            .drawFn = typeErasedDrawFn,
+        };
+    }
+
+    fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
+        const self: *App = @ptrCast(@alignCast(ptr));
+        self.handleEvent(ctx, event) catch |err| {
+            self.setStatusFmt("Error: {s}", .{@errorName(err)}) catch {};
+            ctx.consumeAndRedraw();
+        };
+    }
+
+    fn typeErasedDrawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) Allocator.Error!vxfw.Surface {
+        const self: *App = @ptrCast(@alignCast(ptr));
+        return self.draw(ctx);
+    }
+
+    fn handleEvent(self: *App, ctx: *vxfw.EventContext, event: vxfw.Event) !void {
+        switch (event) {
+            .init => {
+                try self.reloadCurrentScreen();
+                ctx.consumeAndRedraw();
+            },
+            .key_press => |key| try self.handleKeyPress(ctx, key),
+            else => {},
+        }
+    }
+
+    fn handleKeyPress(self: *App, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
+        if (key.matches('c', .{ .ctrl = true })) {
+            ctx.quit = true;
+            ctx.consumeEvent();
+            return;
+        }
+
+        if (key.matches('R', .{}) or key.matches('r', .{ .shift = true })) {
+            try self.reloadCurrentScreen();
+            ctx.consumeAndRedraw();
+            return;
+        }
+
+        if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
+            self.list_view.nextItem(ctx);
+            return;
+        }
+
+        if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
+            self.list_view.prevItem(ctx);
+            return;
+        }
+
+        if (key.matches(vaxis.Key.enter, .{})) {
+            try self.activateSelection();
+            ctx.consumeAndRedraw();
+            return;
+        }
+
+        if (key.matches(vaxis.Key.escape, .{})) {
+            try self.goBack();
+            ctx.consumeAndRedraw();
+            return;
+        }
+
+        if (key.matches('q', .{})) {
+            if (self.screen == .products) {
+                ctx.quit = true;
+                ctx.consumeEvent();
+                return;
+            }
+
+            try self.goBack();
+            ctx.consumeAndRedraw();
+            return;
+        }
+
+        if (key.matches('r', .{}) and self.screen == .build_runs) {
+            try self.triggerBuild();
+            ctx.consumeAndRedraw();
+            return;
+        }
+    }
+
+    fn draw(self: *App, ctx: vxfw.DrawContext) Allocator.Error!vxfw.Surface {
+        const breadcrumb = try self.breadcrumbLine(ctx.arena);
+        const info = self.status_message orelse "";
+        const auth_warning = self.api.authWarning() orelse "";
+
+        const title_block = if (auth_warning.len > 0)
+            try std.fmt.allocPrint(ctx.arena, "{s}\n{s}\n{s}", .{ breadcrumb, auth_warning, info })
+        else
+            try std.fmt.allocPrint(ctx.arena, "{s}\n{s}", .{ breadcrumb, info });
+
+        const hints = try status_bar.line(ctx.arena, self.screen != .products, self.screen == .build_runs);
+
+        const title_text: vxfw.Text = .{
+            .text = title_block,
+            .style = .{ .fg = .{ .index = 6 } },
+            .softwrap = false,
+            .overflow = .clip,
+            .width_basis = .parent,
+        };
+
+        const summary_text: vxfw.Text = .{
+            .text = self.detail_summary,
+            .style = .{ .fg = .{ .index = 8 } },
+            .softwrap = false,
+            .overflow = .clip,
+            .width_basis = .parent,
+        };
+
+        const header_text: vxfw.Text = .{
+            .text = self.header_line,
+            .style = .{ .fg = .{ .index = 4 } },
+            .softwrap = false,
+            .overflow = .clip,
+            .width_basis = .parent,
+        };
+
+        const status_text: vxfw.Text = .{
+            .text = hints,
+            .style = .{ .fg = .{ .index = 3 } },
+            .softwrap = false,
+            .overflow = .clip,
+            .width_basis = .parent,
+        };
+        const list_box: vxfw.SizedBox = .{
+            .child = self.list_view.widget(),
+            .size = .{ .width = 1, .height = 1 },
+        };
+
+        const children = try ctx.arena.alloc(vxfw.FlexItem, 5);
+        children[0] = .{ .widget = title_text.widget(), .flex = 0 };
+        children[1] = .{ .widget = summary_text.widget(), .flex = 0 };
+        children[2] = .{ .widget = header_text.widget(), .flex = 0 };
+        children[3] = .{ .widget = list_box.widget(), .flex = 1 };
+        children[4] = .{ .widget = status_text.widget(), .flex = 0 };
+
+        const column: vxfw.FlexColumn = .{ .children = children };
+        return column.draw(ctx);
+    }
+
+    fn activateSelection(self: *App) !void {
+        switch (self.screen) {
+            .products => {
+                if (self.products.len == 0) return;
+                self.selected_product_index = self.cursorIndex();
+                try self.loadWorkflows();
+            },
+            .workflows => {
+                if (self.workflows.len == 0) return;
+                self.selected_workflow_index = self.cursorIndex();
+                try self.loadBuildRuns();
+            },
+            .build_runs => {
+                if (self.build_runs.len == 0) return;
+                self.selected_build_run_index = self.cursorIndex();
+                try self.loadBuildRunDetail();
+            },
+            .build_run_detail => {},
+        }
+    }
+
+    fn goBack(self: *App) !void {
+        switch (self.screen) {
+            .products => {},
+            .workflows => {
+                self.screen = .products;
+                try self.rebuildRows(self.selected_product_index);
+            },
+            .build_runs => {
+                self.screen = .workflows;
+                try self.rebuildRows(self.selected_workflow_index);
+            },
+            .build_run_detail => {
+                self.screen = .build_runs;
+                try self.rebuildRows(self.selected_build_run_index);
+            },
+        }
+    }
+
+    fn reloadCurrentScreen(self: *App) !void {
+        switch (self.screen) {
+            .products => try self.loadProducts(),
+            .workflows => try self.loadWorkflows(),
+            .build_runs => try self.loadBuildRuns(),
+            .build_run_detail => try self.loadBuildRunDetail(),
+        }
+    }
+
+    fn loadProducts(self: *App) !void {
+        self.clearProducts();
+        self.products = try self.api.listProducts();
+        self.screen = .products;
+
+        if (self.selected_product_index >= self.products.len) {
+            self.selected_product_index = 0;
+        }
+
+        try self.rebuildRows(self.selected_product_index);
+        try self.setStatusFmt("Loaded {d} products", .{self.products.len});
+    }
+
+    fn loadWorkflows(self: *App) !void {
+        if (self.products.len == 0) {
+            try self.setStatus("No products available");
+            return;
+        }
+
+        self.selected_product_index = @min(self.selected_product_index, self.products.len - 1);
+        const product = self.products[self.selected_product_index];
+
+        self.clearWorkflows();
+        self.workflows = try self.api.listWorkflows(product.id);
+        self.screen = .workflows;
+
+        if (self.selected_workflow_index >= self.workflows.len) {
+            self.selected_workflow_index = 0;
+        }
+
+        try self.rebuildRows(self.selected_workflow_index);
+        try self.setStatusFmt("Loaded {d} workflows for {s}", .{ self.workflows.len, product.name });
+    }
+
+    fn loadBuildRuns(self: *App) !void {
+        if (self.workflows.len == 0) {
+            try self.setStatus("No workflows available");
+            return;
+        }
+
+        self.selected_workflow_index = @min(self.selected_workflow_index, self.workflows.len - 1);
+        const workflow = self.workflows[self.selected_workflow_index];
+
+        self.clearBuildRuns();
+        self.build_runs = try self.api.listBuildRuns(workflow.id);
+        std.mem.sort(types.CiBuildRun, self.build_runs, {}, lessThanBuildRunNewestFirst);
+        self.screen = .build_runs;
+
+        if (self.selected_build_run_index >= self.build_runs.len) {
+            self.selected_build_run_index = 0;
+        }
+
+        try self.rebuildRows(self.selected_build_run_index);
+        try self.setStatusFmt("Loaded {d} build runs for {s}", .{ self.build_runs.len, workflow.name });
+    }
+
+    fn lessThanBuildRunNewestFirst(_: void, lhs: types.CiBuildRun, rhs: types.CiBuildRun) bool {
+        const lhs_created = lhs.created_date;
+        const rhs_created = rhs.created_date;
+        if (!std.mem.eql(u8, lhs_created, rhs_created)) {
+            // ISO8601 strings can be compared lexicographically when format is consistent.
+            return std.mem.order(u8, lhs_created, rhs_created) == .gt;
+        }
+
+        const lhs_number = std.fmt.parseUnsigned(u64, lhs.number, 10) catch 0;
+        const rhs_number = std.fmt.parseUnsigned(u64, rhs.number, 10) catch 0;
+        if (lhs_number != rhs_number) {
+            return lhs_number > rhs_number;
+        }
+
+        return std.mem.order(u8, lhs.id, rhs.id) == .lt;
+    }
+
+    fn loadBuildRunDetail(self: *App) !void {
+        if (self.build_runs.len == 0) {
+            try self.setStatus("No build runs available");
+            return;
+        }
+
+        self.selected_build_run_index = @min(self.selected_build_run_index, self.build_runs.len - 1);
+        const run = self.build_runs[self.selected_build_run_index];
+
+        self.clearBuildRunDetail();
+        self.clearBuildActions();
+
+        self.build_run_detail = try self.api.getBuildRun(run.id);
+        self.build_actions = try self.api.listBuildActions(run.id);
+        self.screen = .build_run_detail;
+
+        try self.rebuildRows(0);
+        try self.setStatusFmt("Loaded details for build run #{s}", .{run.number});
+    }
+
+    fn triggerBuild(self: *App) !void {
+        if (self.screen != .build_runs or self.workflows.len == 0) return;
+
+        self.selected_workflow_index = @min(self.selected_workflow_index, self.workflows.len - 1);
+        const workflow = self.workflows[self.selected_workflow_index];
+
+        const created = try self.api.createBuildRun(workflow.id);
+        defer types.freeBuildRun(self.allocator, created);
+
+        try self.setStatusFmt("Triggered build run #{s}", .{created.number});
+        try self.loadBuildRuns();
+    }
+
+    fn rebuildRows(self: *App, cursor: usize) !void {
+        self.rows_arena.deinit();
+        self.rows_arena = std.heap.ArenaAllocator.init(self.allocator);
+        const arena = self.rows_arena.allocator();
+
+        self.title_line = "";
+        self.header_line = "";
+        self.detail_summary = "";
+
+        switch (self.screen) {
+            .products => {
+                self.title_line = "Products";
+                self.header_line = try products_view.header(arena);
+                self.row_entries = try arena.alloc(RowEntry, self.products.len);
+                for (self.products, 0..) |item, idx| {
+                    const line = try products_view.row(arena, item);
+                    self.row_entries[idx] = makeRowEntry(line);
+                }
+            },
+            .workflows => {
+                const product_name = if (self.products.len == 0) "-" else self.products[self.selected_product_index].name;
+                self.title_line = try std.fmt.allocPrint(arena, "Workflows for {s}", .{product_name});
+                self.header_line = try workflows_view.header(arena);
+                self.row_entries = try arena.alloc(RowEntry, self.workflows.len);
+                for (self.workflows, 0..) |item, idx| {
+                    const line = try workflows_view.row(arena, item);
+                    self.row_entries[idx] = makeRowEntry(line);
+                }
+            },
+            .build_runs => {
+                const workflow_name = if (self.workflows.len == 0) "-" else self.workflows[self.selected_workflow_index].name;
+                self.title_line = try std.fmt.allocPrint(arena, "Build Runs for {s}", .{workflow_name});
+                self.header_line = try build_runs_view.header(arena);
+                self.row_entries = try arena.alloc(RowEntry, self.build_runs.len);
+                for (self.build_runs, 0..) |item, idx| {
+                    const line = try build_runs_view.row(arena, item);
+                    self.row_entries[idx] = makeRowEntry(line);
+                }
+            },
+            .build_run_detail => {
+                self.title_line = "Build Run Detail";
+                if (self.build_run_detail) |detail| {
+                    self.detail_summary = try build_run_detail_view.summaryLine(arena, detail);
+                }
+                self.header_line = try build_run_detail_view.actionHeader(arena);
+                self.row_entries = try arena.alloc(RowEntry, self.build_actions.len);
+                for (self.build_actions, 0..) |item, idx| {
+                    const line = try build_run_detail_view.actionRow(arena, item);
+                    self.row_entries[idx] = makeRowEntry(line);
+                }
+            },
+        }
+
+        self.resetListView(cursor);
+    }
+
+    fn resetListView(self: *App, cursor: usize) void {
+        self.list_view = .{
+            .children = .{ .builder = .{ .userdata = self, .buildFn = App.buildRow } },
+            .draw_cursor = false,
+            .item_count = @intCast(self.row_entries.len),
+        };
+
+        if (self.row_entries.len == 0) {
+            self.list_view.cursor = 0;
+            return;
+        }
+
+        const clamped = @min(cursor, self.row_entries.len - 1);
+        self.list_view.cursor = @intCast(clamped);
+    }
+
+    fn breadcrumbLine(self: *App, allocator: Allocator) Allocator.Error![]u8 {
+        return switch (self.screen) {
+            .products => std.fmt.allocPrint(allocator, "Xcode Cloud > {s}", .{self.titleLine()}),
+            .workflows => std.fmt.allocPrint(allocator, "Xcode Cloud > Products > {s}", .{self.titleLine()}),
+            .build_runs => std.fmt.allocPrint(allocator, "Xcode Cloud > Products > Workflows > {s}", .{self.titleLine()}),
+            .build_run_detail => std.fmt.allocPrint(allocator, "Xcode Cloud > Products > Workflows > Build Runs > Detail", .{}),
+        };
+    }
+
+    fn titleLine(self: *const App) []const u8 {
+        if (self.title_line.len > 0) return self.title_line;
+        return switch (self.screen) {
+            .products => "Products",
+            .workflows => "Workflows",
+            .build_runs => "Build Runs",
+            .build_run_detail => "Build Run Detail",
+        };
+    }
+
+    fn cursorIndex(self: *const App) usize {
+        return @intCast(self.list_view.cursor);
+    }
+
+    fn setStatus(self: *App, msg: []const u8) !void {
+        if (self.status_message) |old| {
+            self.allocator.free(old);
+        }
+        self.status_message = try self.allocator.dupe(u8, msg);
+    }
+
+    fn setStatusFmt(self: *App, comptime fmt: []const u8, args: anytype) !void {
+        const msg = try std.fmt.allocPrint(self.allocator, fmt, args);
+        if (self.status_message) |old| {
+            self.allocator.free(old);
+        }
+        self.status_message = msg;
+    }
+
+    fn makeRowEntry(line: []const u8) RowEntry {
+        return .{
+            .line = line,
+            .text = .{
+                .text = line,
+                .softwrap = false,
+                .overflow = .clip,
+                .width_basis = .parent,
+            },
+        };
+    }
+
+    fn buildRow(userdata: *const anyopaque, idx: usize, cursor: usize) ?vxfw.Widget {
+        const self: *App = @ptrCast(@alignCast(@constCast(userdata)));
+        if (idx >= self.row_entries.len) return null;
+
+        const entry = &self.row_entries[idx];
+        entry.text.style = if (idx == cursor)
+            .{ .reverse = true }
+        else
+            .{};
+        return entry.text.widget();
+    }
+
+    fn clearProducts(self: *App) void {
+        if (self.products.len > 0) {
+            types.freeProducts(self.allocator, self.products);
+            self.products = &.{};
+        }
+    }
+
+    fn clearWorkflows(self: *App) void {
+        if (self.workflows.len > 0) {
+            types.freeWorkflows(self.allocator, self.workflows);
+            self.workflows = &.{};
+        }
+    }
+
+    fn clearBuildRuns(self: *App) void {
+        if (self.build_runs.len > 0) {
+            types.freeBuildRuns(self.allocator, self.build_runs);
+            self.build_runs = &.{};
+        }
+    }
+
+    fn clearBuildActions(self: *App) void {
+        if (self.build_actions.len > 0) {
+            types.freeBuildActions(self.allocator, self.build_actions);
+            self.build_actions = &.{};
+        }
+    }
+
+    fn clearBuildRunDetail(self: *App) void {
+        if (self.build_run_detail) |detail| {
+            types.freeBuildRun(self.allocator, detail);
+            self.build_run_detail = null;
+        }
+    }
+};
