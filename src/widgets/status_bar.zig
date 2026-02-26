@@ -2,7 +2,16 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 
-pub fn line(allocator: Allocator, can_go_back: bool, can_run: bool, can_download: bool) Allocator.Error![]u8 {
+pub fn line(
+    allocator: Allocator,
+    can_go_back: bool,
+    can_run: bool,
+    can_download: bool,
+    is_log_viewer: bool,
+) Allocator.Error![]u8 {
+    if (is_log_viewer) {
+        return allocator.dupe(u8, "j/k:Scroll  Ctrl+D/U:HalfPage  h/l:Horizontal  Esc/q:Back  Ctrl+C:Quit");
+    }
     if (can_go_back and can_download) {
         return allocator.dupe(u8, "j/k:Move  Enter:Open  d:Download  Esc/q:Back  R:Reload  Ctrl+C:Quit");
     }

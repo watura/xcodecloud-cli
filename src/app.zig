@@ -20,6 +20,7 @@ pub const Screen = enum {
     build_runs,
     build_run_detail,
     build_action_artifacts,
+    log_viewer,
 };
 
 const RowEntry = struct {
@@ -33,6 +34,7 @@ pub const App = struct {
 
     screen: Screen = .products,
     list_view: vxfw.ListView,
+    log_scroll_view: vxfw.ScrollView,
 
     rows_arena: std.heap.ArenaAllocator,
     row_entries: []RowEntry = &.{},
@@ -51,6 +53,10 @@ pub const App = struct {
     selected_workflow_index: usize = 0,
     selected_build_run_index: usize = 0,
     selected_build_action_index: usize = 0,
+    selected_artifact_index: usize = 0,
+
+    log_content: ?[]u8 = null,
+    log_artifact_name: []const u8 = "",
 
     status_message: ?[]u8 = null,
 
@@ -64,10 +70,16 @@ pub const App = struct {
                 .draw_cursor = false,
                 .item_count = 0,
             },
+            .log_scroll_view = .{
+                .children = .{ .builder = .{ .userdata = undefined, .buildFn = App.buildRow } },
+                .draw_cursor = false,
+                .item_count = 0,
+            },
             .rows_arena = std.heap.ArenaAllocator.init(allocator),
         };
 
         app.list_view.children = .{ .builder = .{ .userdata = &app, .buildFn = App.buildRow } };
+        app.log_scroll_view.children = .{ .builder = .{ .userdata = &app, .buildFn = App.buildRow } };
 
         if (api.authWarning()) |warning| {
             try app.setStatus(warning);
@@ -85,6 +97,7 @@ pub const App = struct {
         self.clearBuildActions();
         self.clearBuildActionArtifacts();
         self.clearBuildRunDetail();
+        self.clearLogContent();
 
         if (self.status_message) |message| {
             self.allocator.free(message);
@@ -127,6 +140,11 @@ pub const App = struct {
                 try self.scheduleNextPoll(ctx);
             },
             .key_press => |key| try self.handleKeyPress(ctx, key),
+            .mouse => |mouse| {
+                if (self.screen == .log_viewer) {
+                    try self.log_scroll_view.handleEvent(ctx, .{ .mouse = mouse });
+                }
+            },
             else => {},
         }
     }
@@ -176,22 +194,6 @@ pub const App = struct {
             return;
         }
 
-        if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
-            self.list_view.nextItem(ctx);
-            return;
-        }
-
-        if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
-            self.list_view.prevItem(ctx);
-            return;
-        }
-
-        if (key.matches(vaxis.Key.enter, .{})) {
-            try self.activateSelection();
-            ctx.consumeAndRedraw();
-            return;
-        }
-
         if (key.matches(vaxis.Key.escape, .{})) {
             try self.goBack();
             ctx.consumeAndRedraw();
@@ -210,6 +212,26 @@ pub const App = struct {
             return;
         }
 
+        if (key.matches(vaxis.Key.enter, .{})) {
+            if (self.screen == .log_viewer) {
+                ctx.consumeEvent();
+                return;
+            }
+            try self.activateSelection();
+            ctx.consumeAndRedraw();
+            return;
+        }
+
+        if ((key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) and self.screen != .log_viewer) {
+            self.list_view.nextItem(ctx);
+            return;
+        }
+
+        if ((key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) and self.screen != .log_viewer) {
+            self.list_view.prevItem(ctx);
+            return;
+        }
+
         if (key.matches('r', .{}) and self.screen == .build_runs) {
             try self.triggerBuild();
             ctx.consumeAndRedraw();
@@ -219,6 +241,30 @@ pub const App = struct {
         if (key.matches('d', .{}) and self.screen == .build_action_artifacts) {
             try self.downloadSelectedArtifact();
             ctx.consumeAndRedraw();
+            return;
+        }
+
+        if (self.screen == .log_viewer) {
+            if (key.matches(vaxis.Key.page_down, .{})) {
+                const scroll_lines: u8 = 20;
+                if (self.log_scroll_view.scroll.linesDown(scroll_lines)) {
+                    ctx.consumeAndRedraw();
+                } else {
+                    ctx.consumeEvent();
+                }
+                return;
+            }
+            if (key.matches(vaxis.Key.page_up, .{})) {
+                const scroll_lines: u8 = 20;
+                if (self.log_scroll_view.scroll.linesUp(scroll_lines)) {
+                    ctx.consumeAndRedraw();
+                } else {
+                    ctx.consumeEvent();
+                }
+                return;
+            }
+
+            try self.log_scroll_view.handleEvent(ctx, .{ .key_press = key });
             return;
         }
     }
@@ -238,6 +284,7 @@ pub const App = struct {
             self.screen != .products,
             self.screen == .build_runs,
             self.screen == .build_action_artifacts,
+            self.screen == .log_viewer,
         );
 
         const title_text: vxfw.Text = .{
@@ -271,8 +318,13 @@ pub const App = struct {
             .overflow = .clip,
             .width_basis = .parent,
         };
+        const list_widget = if (self.screen == .log_viewer)
+            self.log_scroll_view.widget()
+        else
+            self.list_view.widget();
+
         const list_box: vxfw.SizedBox = .{
-            .child = self.list_view.widget(),
+            .child = list_widget,
             .size = .{ .width = 1, .height = 1 },
         };
 
@@ -310,8 +362,9 @@ pub const App = struct {
                 try self.loadBuildActionArtifacts();
             },
             .build_action_artifacts => {
-                try self.openSelectedArtifactUrl();
+                try self.openOrViewArtifact();
             },
+            .log_viewer => {},
         }
     }
 
@@ -334,6 +387,11 @@ pub const App = struct {
                 self.screen = .build_run_detail;
                 try self.rebuildRows(self.selected_build_action_index);
             },
+            .log_viewer => {
+                self.clearLogContent();
+                self.screen = .build_action_artifacts;
+                try self.rebuildRows(self.selected_artifact_index);
+            },
         }
     }
 
@@ -344,6 +402,7 @@ pub const App = struct {
             .build_runs => try self.loadBuildRuns(),
             .build_run_detail => try self.loadBuildRunDetail(),
             .build_action_artifacts => try self.loadBuildActionArtifacts(),
+            .log_viewer => try self.loadLogContent(),
         }
     }
 
@@ -500,8 +559,11 @@ pub const App = struct {
         self.clearBuildActionArtifacts();
         self.build_action_artifacts = try self.api.listArtifactsForAction(action.id);
         self.screen = .build_action_artifacts;
+        if (self.selected_artifact_index >= self.build_action_artifacts.len) {
+            self.selected_artifact_index = 0;
+        }
 
-        try self.rebuildRows(0);
+        try self.rebuildRows(self.selected_artifact_index);
         try self.setStatusFmt("Loaded {d} artifacts for action {s}", .{ self.build_action_artifacts.len, action.name });
     }
 
@@ -510,20 +572,52 @@ pub const App = struct {
             try self.setStatus("No artifacts available");
             return;
         }
-        const idx = self.cursorIndex();
-        const artifact = self.build_action_artifacts[@min(idx, self.build_action_artifacts.len - 1)];
+        self.selected_artifact_index = @min(self.cursorIndex(), self.build_action_artifacts.len - 1);
+        const artifact = self.build_action_artifacts[self.selected_artifact_index];
         const saved_path = try self.api.downloadArtifact(artifact);
         defer self.allocator.free(saved_path);
         try self.setStatusFmt("Downloaded: {s}", .{saved_path});
     }
 
-    fn openSelectedArtifactUrl(self: *App) !void {
+    fn openOrViewArtifact(self: *App) !void {
         if (self.build_action_artifacts.len == 0) {
             try self.setStatus("No artifacts available");
             return;
         }
-        const idx = self.cursorIndex();
-        const artifact = self.build_action_artifacts[@min(idx, self.build_action_artifacts.len - 1)];
+        self.selected_artifact_index = @min(self.cursorIndex(), self.build_action_artifacts.len - 1);
+        const artifact = self.build_action_artifacts[self.selected_artifact_index];
+        if (isLogArtifactType(artifact.file_type)) {
+            try self.loadLogContentForArtifact(artifact);
+            return;
+        }
+
+        try self.openArtifactUrl(artifact);
+    }
+
+    fn loadLogContentForArtifact(self: *App, artifact: types.CiArtifact) !void {
+        self.clearLogContent();
+        self.log_content = try self.api.fetchArtifactContent(artifact);
+        self.log_artifact_name = try self.allocator.dupe(u8, artifact.file_name);
+        self.screen = .log_viewer;
+        try self.rebuildRows(0);
+        try self.setStatusFmt("Viewing log: {s}", .{artifact.file_name});
+    }
+
+    fn loadLogContent(self: *App) !void {
+        if (self.build_action_artifacts.len == 0) {
+            try self.setStatus("No artifacts available");
+            return;
+        }
+        self.selected_artifact_index = @min(self.selected_artifact_index, self.build_action_artifacts.len - 1);
+        const artifact = self.build_action_artifacts[self.selected_artifact_index];
+        if (!isLogArtifactType(artifact.file_type)) {
+            try self.setStatus("Selected artifact is not a log");
+            return;
+        }
+        try self.loadLogContentForArtifact(artifact);
+    }
+
+    fn openArtifactUrl(self: *App, artifact: types.CiArtifact) !void {
         if (std.mem.eql(u8, artifact.download_url, "-")) {
             try self.setStatus("No download URL for selected artifact");
             return;
@@ -624,9 +718,41 @@ pub const App = struct {
                     self.row_entries[idx] = makeRowEntry(line);
                 }
             },
+            .log_viewer => {
+                const artifact_name = if (self.log_artifact_name.len == 0) "-" else self.log_artifact_name;
+                self.title_line = try std.fmt.allocPrint(arena, "Log Viewer: {s}", .{artifact_name});
+                self.header_line = "";
+                self.detail_summary = "";
+
+                if (self.log_content) |content| {
+                    if (content.len == 0) {
+                        self.row_entries = try arena.alloc(RowEntry, 1);
+                        self.row_entries[0] = makeRowEntry("(empty log)");
+                    } else {
+                        var line_count: usize = 1;
+                        for (content) |ch| {
+                            if (ch == '\n') line_count += 1;
+                        }
+                        self.row_entries = try arena.alloc(RowEntry, line_count);
+
+                        var it = std.mem.splitScalar(u8, content, '\n');
+                        var idx: usize = 0;
+                        while (it.next()) |line| : (idx += 1) {
+                            self.row_entries[idx] = makeRowEntry(line);
+                        }
+                    }
+                } else {
+                    self.row_entries = try arena.alloc(RowEntry, 1);
+                    self.row_entries[0] = makeRowEntry("No log content loaded");
+                }
+            },
         }
 
-        self.resetListView(cursor);
+        if (self.screen == .log_viewer) {
+            self.resetLogScrollView();
+        } else {
+            self.resetListView(cursor);
+        }
     }
 
     fn resetListView(self: *App, cursor: usize) void {
@@ -645,6 +771,16 @@ pub const App = struct {
         self.list_view.cursor = @intCast(clamped);
     }
 
+    fn resetLogScrollView(self: *App) void {
+        self.log_scroll_view = .{
+            .children = .{ .builder = .{ .userdata = self, .buildFn = App.buildRow } },
+            .draw_cursor = false,
+            .item_count = @intCast(self.row_entries.len),
+            .scroll = .{},
+            .cursor = 0,
+        };
+    }
+
     fn breadcrumbLine(self: *App, allocator: Allocator) Allocator.Error![]u8 {
         return switch (self.screen) {
             .products => std.fmt.allocPrint(allocator, "Xcode Cloud > {s}", .{self.titleLine()}),
@@ -652,6 +788,7 @@ pub const App = struct {
             .build_runs => std.fmt.allocPrint(allocator, "Xcode Cloud > Products > Workflows > {s}", .{self.titleLine()}),
             .build_run_detail => std.fmt.allocPrint(allocator, "Xcode Cloud > Products > Workflows > Build Runs > Detail", .{}),
             .build_action_artifacts => std.fmt.allocPrint(allocator, "Xcode Cloud > Products > Workflows > Build Runs > Detail > Artifacts", .{}),
+            .log_viewer => std.fmt.allocPrint(allocator, "Xcode Cloud > Products > Workflows > Build Runs > Detail > Artifacts > Log Viewer", .{}),
         };
     }
 
@@ -663,6 +800,7 @@ pub const App = struct {
             .build_runs => "Build Runs",
             .build_run_detail => "Build Run Detail",
             .build_action_artifacts => "Build Action Artifacts",
+            .log_viewer => "Log Viewer",
         };
     }
 
@@ -702,7 +840,8 @@ pub const App = struct {
         if (idx >= self.row_entries.len) return null;
 
         const entry = &self.row_entries[idx];
-        entry.text.style = if (idx == cursor)
+        entry.text.width_basis = if (self.screen == .log_viewer) .longest_line else .parent;
+        entry.text.style = if (self.screen != .log_viewer and idx == cursor)
             .{ .reverse = true }
         else
             .{};
@@ -750,6 +889,17 @@ pub const App = struct {
             self.build_run_detail = null;
         }
     }
+
+    fn clearLogContent(self: *App) void {
+        if (self.log_content) |content| {
+            self.allocator.free(content);
+            self.log_content = null;
+        }
+        if (self.log_artifact_name.len > 0) {
+            self.allocator.free(self.log_artifact_name);
+            self.log_artifact_name = "";
+        }
+    }
 };
 
 fn workflowsEqual(a: []const types.CiWorkflow, b: []const types.CiWorkflow) bool {
@@ -775,4 +925,8 @@ fn buildRunsEqual(a: []const types.CiBuildRun, b: []const types.CiBuildRun) bool
         if (!std.mem.eql(u8, lhs.finished_date, rhs.finished_date)) return false;
     }
     return true;
+}
+
+fn isLogArtifactType(file_type: []const u8) bool {
+    return std.mem.eql(u8, file_type, "LOG") or std.mem.eql(u8, file_type, "LOG_BUNDLE");
 }
