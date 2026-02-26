@@ -157,7 +157,7 @@ pub const App = struct {
         switch (self.screen) {
             .workflows => {
                 const changed = self.refreshWorkflowsIfChanged() catch |err| {
-                    try self.setStatusFmt("Polling failed: {s}", .{@errorName(err)});
+                    try self.setPollingFailedStatus(err);
                     ctx.consumeAndRedraw();
                     return;
                 };
@@ -168,7 +168,7 @@ pub const App = struct {
             },
             .build_runs => {
                 const changed = self.refreshBuildRunsIfChanged() catch |err| {
-                    try self.setStatusFmt("Polling failed: {s}", .{@errorName(err)});
+                    try self.setPollingFailedStatus(err);
                     ctx.consumeAndRedraw();
                     return;
                 };
@@ -821,6 +821,26 @@ pub const App = struct {
             self.allocator.free(old);
         }
         self.status_message = msg;
+    }
+
+    fn setPollingFailedStatus(self: *App, err: anyerror) !void {
+        const detail = switch (err) {
+            error.RateLimited => "RateLimited (429)",
+            error.Unauthorized => "Unauthorized (401)",
+            error.Forbidden => "Forbidden (403)",
+            error.NotFound => "NotFound (404)",
+            else => @errorName(err),
+        };
+
+        const hint = switch (err) {
+            error.RateLimited => " - API rate limit reached",
+            error.Unauthorized => " - check API key/issuer and system clock",
+            error.Forbidden => " - check App Store Connect role/permissions",
+            error.NotFound => " - target resource may have been deleted",
+            else => "",
+        };
+
+        try self.setStatusFmt("Polling failed: {s}{s}", .{ detail, hint });
     }
 
     fn makeRowEntry(line: []const u8) RowEntry {
