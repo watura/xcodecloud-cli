@@ -128,6 +128,30 @@ pub const Client = struct {
         return types.parseArtifacts(self.allocator, body);
     }
 
+    pub fn fetchArtifactContent(self: *Client, artifact: types.CiArtifact) ![]u8 {
+        if (std.mem.startsWith(u8, artifact.download_url, "mock://")) {
+            return mockLogContent(self.allocator, artifact);
+        }
+
+        var sink: std.Io.Writer.Allocating = .init(self.allocator);
+        defer sink.deinit();
+
+        const result = try self.http.fetch(.{
+            .location = .{ .url = artifact.download_url },
+            .method = .GET,
+            .response_writer = &sink.writer,
+        });
+        if (result.status.class() != .success) return error.HttpRequestFailed;
+
+        const raw = try self.allocator.dupe(u8, sink.written());
+        if (isLogBundleArtifactType(artifact.file_type) or isZipData(raw)) {
+            defer self.allocator.free(raw);
+            return decodeLogBundleContent(self.allocator, raw);
+        }
+
+        return normalizeViewerText(self.allocator, raw);
+    }
+
     pub fn downloadArtifact(self: *Client, artifact: types.CiArtifact) ![]u8 {
         try std.fs.cwd().makePath("downloads");
 
@@ -402,6 +426,144 @@ fn mockArtifactsForAction(allocator: Allocator, action_id: []const u8) ![]types.
         .download_url = try std.fmt.allocPrint(allocator, "mock://{s}/result.xcresult", .{action_id}),
     };
     return items;
+}
+
+fn mockLogContent(allocator: Allocator, artifact: types.CiArtifact) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        \\2026-02-25T08:11:00.102Z [INFO] Build action started: {s}
+        \\2026-02-25T08:11:01.001Z [INFO] Select Xcode 16.1 (16B40)
+        \\2026-02-25T08:11:02.942Z [INFO] Resolve Swift Package dependencies
+        \\2026-02-25T08:11:03.487Z [INFO] Clean build folder
+        \\2026-02-25T08:11:05.014Z [INFO] Run script: ci_prebuild.sh
+        \\2026-02-25T08:11:05.622Z [WARN] Optional secret \"SLACK_WEBHOOK\" is not set; notifications disabled
+        \\2026-02-25T08:11:08.913Z [INFO] xcodebuild -workspace SampleApp.xcworkspace -scheme SampleApp -configuration Release -destination generic/platform=iOS -derivedDataPath /Volumes/workspace/DerivedData
+        \\2026-02-25T08:11:17.275Z [INFO] CompileSwiftSources normal arm64 com.apple.xcode.tools.swift.compiler
+        \\2026-02-25T08:11:23.144Z [INFO] Ld /Volumes/workspace/Build/Products/Release-iphoneos/SampleApp.app/SampleApp normal
+        \\2026-02-25T08:11:24.552Z [INFO] CodeSign /Volumes/workspace/Build/Products/Release-iphoneos/SampleApp.app
+        \\2026-02-25T08:11:25.097Z [INFO] Build Succeeded (143.8 sec)
+        \\2026-02-25T08:11:25.314Z [INFO] Archive written to /Volumes/workspace/Artifacts/SampleApp.xcarchive
+        \\2026-02-25T08:11:25.978Z [INFO] Upload artifact complete: {s}
+        \\2026-02-25T08:11:26.001Z [INFO] Done
+    ,
+        .{ artifact.file_name, artifact.file_name },
+    );
+}
+
+fn decodeLogBundleContent(allocator: Allocator, zipped: []const u8) ![]u8 {
+    try std.fs.cwd().makePath(".context/tmp");
+
+    const zip_path = try std.fmt.allocPrint(
+        allocator,
+        ".context/tmp/log_bundle_{d}.zip",
+        .{std.time.nanoTimestamp()},
+    );
+    defer allocator.free(zip_path);
+
+    {
+        var file = try std.fs.cwd().createFile(zip_path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(zipped);
+    }
+    defer std.fs.cwd().deleteFile(zip_path) catch {};
+
+    const list = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "unzip", "-Z1", zip_path },
+        .max_output_bytes = 4 * 1024 * 1024,
+    }) catch |err| {
+        return std.fmt.allocPrint(
+            allocator,
+            "LOG_BUNDLE decode failed ({s}). Use d:Download.",
+            .{@errorName(err)},
+        );
+    };
+    defer allocator.free(list.stdout);
+    defer allocator.free(list.stderr);
+
+    if (!termExitedZero(list.term)) {
+        return allocator.dupe(u8, "LOG_BUNDLE list failed. Use d:Download.");
+    }
+
+    const entry = selectLogBundleEntry(list.stdout) orelse {
+        return allocator.dupe(u8, "LOG_BUNDLE had no extractable files. Use d:Download.");
+    };
+
+    const extracted = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "unzip", "-p", zip_path, entry },
+        .max_output_bytes = 32 * 1024 * 1024,
+    }) catch |err| {
+        return std.fmt.allocPrint(
+            allocator,
+            "LOG_BUNDLE extraction failed ({s}). Use d:Download.",
+            .{@errorName(err)},
+        );
+    };
+    defer allocator.free(extracted.stderr);
+
+    if (!termExitedZero(extracted.term)) {
+        allocator.free(extracted.stdout);
+        return allocator.dupe(u8, "LOG_BUNDLE extraction failed. Use d:Download.");
+    }
+
+    return normalizeViewerText(allocator, extracted.stdout);
+}
+
+fn selectLogBundleEntry(listing: []const u8) ?[]const u8 {
+    var first_file: ?[]const u8 = null;
+    var lines = std.mem.tokenizeAny(u8, listing, "\r\n");
+    while (lines.next()) |line| {
+        if (line.len == 0 or line[line.len - 1] == '/') continue;
+        if (first_file == null) {
+            first_file = line;
+        }
+        if (isPreferredLogFile(line)) {
+            return line;
+        }
+    }
+    return first_file;
+}
+
+fn isPreferredLogFile(path: []const u8) bool {
+    return endsWithIgnoreCase(path, ".log") or
+        endsWithIgnoreCase(path, ".txt") or
+        endsWithIgnoreCase(path, ".json") or
+        endsWithIgnoreCase(path, ".xml") or
+        endsWithIgnoreCase(path, ".md") or
+        endsWithIgnoreCase(path, ".xcactivitylog");
+}
+
+fn endsWithIgnoreCase(haystack: []const u8, suffix: []const u8) bool {
+    if (haystack.len < suffix.len) return false;
+    return std.ascii.eqlIgnoreCase(haystack[haystack.len - suffix.len ..], suffix);
+}
+
+fn isLogBundleArtifactType(file_type: []const u8) bool {
+    return std.mem.eql(u8, file_type, "LOG_BUNDLE");
+}
+
+fn isZipData(data: []const u8) bool {
+    if (data.len < 4) return false;
+    if (data[0] != 'P' or data[1] != 'K') return false;
+    return (data[2] == 3 and data[3] == 4) or
+        (data[2] == 5 and data[3] == 6) or
+        (data[2] == 7 and data[3] == 8);
+}
+
+fn normalizeViewerText(allocator: Allocator, content: []u8) ![]u8 {
+    if (std.unicode.utf8ValidateSlice(content)) {
+        return content;
+    }
+    allocator.free(content);
+    return allocator.dupe(u8, "Artifact content is binary/non-UTF8. Use d:Download.");
+}
+
+fn termExitedZero(term: std.process.Child.Term) bool {
+    return switch (term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
 }
 
 fn sanitizeFileNameAlloc(allocator: Allocator, raw: []const u8) ![]u8 {
