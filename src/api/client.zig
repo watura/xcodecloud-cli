@@ -4,6 +4,8 @@ const endpoints = @import("endpoints.zig");
 const types = @import("types.zig");
 
 const Allocator = std.mem.Allocator;
+const max_http_attempts: u8 = 3;
+const retry_base_delay_ns: u64 = 250 * std.time.ns_per_ms;
 
 pub const Client = struct {
     allocator: Allocator,
@@ -133,23 +135,43 @@ pub const Client = struct {
             return mockLogContent(self.allocator, artifact);
         }
 
-        var sink: std.Io.Writer.Allocating = .init(self.allocator);
-        defer sink.deinit();
+        var attempt: u8 = 0;
+        while (attempt < max_http_attempts) : (attempt += 1) {
+            var sink: std.Io.Writer.Allocating = .init(self.allocator);
+            defer sink.deinit();
 
-        const result = try self.http.fetch(.{
-            .location = .{ .url = artifact.download_url },
-            .method = .GET,
-            .response_writer = &sink.writer,
-        });
-        if (result.status.class() != .success) return error.HttpRequestFailed;
+            const result = self.http.fetch(.{
+                .location = .{ .url = artifact.download_url },
+                .method = .GET,
+                .response_writer = &sink.writer,
+            }) catch |err| {
+                if (attempt + 1 < max_http_attempts and isRetryableFetchError(err)) {
+                    resetHttpClient(self);
+                    std.Thread.sleep(retryDelayNs(attempt));
+                    continue;
+                }
+                return err;
+            };
 
-        const raw = try self.allocator.dupe(u8, sink.written());
-        if (isLogBundleArtifactType(artifact.file_type) or isZipData(raw)) {
-            defer self.allocator.free(raw);
-            return decodeLogBundleContent(self.allocator, raw);
+            if (result.status.class() != .success) {
+                if (attempt + 1 < max_http_attempts and isRetryableStatus(result.status)) {
+                    resetHttpClient(self);
+                    std.Thread.sleep(retryDelayNs(attempt));
+                    continue;
+                }
+                return mapHttpStatusToError(result.status);
+            }
+
+            const raw = try self.allocator.dupe(u8, sink.written());
+            if (isLogBundleArtifactType(artifact.file_type) or isZipData(raw)) {
+                defer self.allocator.free(raw);
+                return decodeLogBundleContent(self.allocator, raw);
+            }
+
+            return normalizeViewerText(self.allocator, raw);
         }
 
-        return normalizeViewerText(self.allocator, raw);
+        return error.HttpRequestFailed;
     }
 
     pub fn downloadArtifact(self: *Client, artifact: types.CiArtifact) ![]u8 {
@@ -168,21 +190,40 @@ pub const Client = struct {
             return out_path;
         }
 
-        var sink: std.Io.Writer.Allocating = .init(self.allocator);
-        defer sink.deinit();
+        var attempt: u8 = 0;
+        while (attempt < max_http_attempts) : (attempt += 1) {
+            var sink: std.Io.Writer.Allocating = .init(self.allocator);
+            defer sink.deinit();
 
-        const result = try self.http.fetch(.{
-            .location = .{ .url = artifact.download_url },
-            .method = .GET,
-            .response_writer = &sink.writer,
-        });
-        if (result.status.class() != .success) return error.HttpRequestFailed;
+            const result = self.http.fetch(.{
+                .location = .{ .url = artifact.download_url },
+                .method = .GET,
+                .response_writer = &sink.writer,
+            }) catch |err| {
+                if (attempt + 1 < max_http_attempts and isRetryableFetchError(err)) {
+                    resetHttpClient(self);
+                    std.Thread.sleep(retryDelayNs(attempt));
+                    continue;
+                }
+                return err;
+            };
 
-        var file = try std.fs.cwd().createFile(out_path, .{ .truncate = true });
-        defer file.close();
-        try file.writeAll(sink.written());
+            if (result.status.class() != .success) {
+                if (attempt + 1 < max_http_attempts and isRetryableStatus(result.status)) {
+                    resetHttpClient(self);
+                    std.Thread.sleep(retryDelayNs(attempt));
+                    continue;
+                }
+                return mapHttpStatusToError(result.status);
+            }
 
-        return out_path;
+            var file = try std.fs.cwd().createFile(out_path, .{ .truncate = true });
+            defer file.close();
+            try file.writeAll(sink.written());
+            return out_path;
+        }
+
+        return error.HttpRequestFailed;
     }
 
     fn requestJson(
@@ -202,30 +243,86 @@ pub const Client = struct {
         const url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ endpoints.base_url, path });
         defer self.allocator.free(url);
 
-        var sink: std.Io.Writer.Allocating = .init(self.allocator);
-        defer sink.deinit();
-
         var headers = [_]std.http.Header{
             .{ .name = "accept", .value = "application/json" },
             .{ .name = "authorization", .value = auth_header },
             .{ .name = "content-type", .value = "application/json" },
         };
 
-        const result = try self.http.fetch(.{
-            .location = .{ .url = url },
-            .method = method,
-            .payload = payload,
-            .extra_headers = if (payload != null) headers[0..3] else headers[0..2],
-            .response_writer = &sink.writer,
-        });
+        var attempt: u8 = 0;
+        while (attempt < max_http_attempts) : (attempt += 1) {
+            var sink: std.Io.Writer.Allocating = .init(self.allocator);
+            defer sink.deinit();
 
-        if (result.status.class() != .success) {
-            return error.HttpRequestFailed;
+            const result = self.http.fetch(.{
+                .location = .{ .url = url },
+                .method = method,
+                .payload = payload,
+                .extra_headers = if (payload != null) headers[0..3] else headers[0..2],
+                .response_writer = &sink.writer,
+            }) catch |err| {
+                if (attempt + 1 < max_http_attempts and isRetryableFetchError(err)) {
+                    resetHttpClient(self);
+                    std.Thread.sleep(retryDelayNs(attempt));
+                    continue;
+                }
+                return err;
+            };
+
+            if (result.status.class() != .success) {
+                if (attempt + 1 < max_http_attempts and isRetryableStatus(result.status)) {
+                    resetHttpClient(self);
+                    std.Thread.sleep(retryDelayNs(attempt));
+                    continue;
+                }
+                return mapHttpStatusToError(result.status);
+            }
+
+            return self.allocator.dupe(u8, sink.written());
         }
 
-        return self.allocator.dupe(u8, sink.written());
+        return error.HttpRequestFailed;
     }
 };
+
+fn retryDelayNs(attempt: u8) u64 {
+    return retry_base_delay_ns * (@as(u64, attempt) + 1);
+}
+
+fn isRetryableStatus(status: std.http.Status) bool {
+    const code: u16 = @intFromEnum(status);
+    return code == 429 or code == 500 or code == 502 or code == 503 or code == 504;
+}
+
+fn mapHttpStatusToError(status: std.http.Status) anyerror {
+    return switch (@intFromEnum(status)) {
+        401 => error.Unauthorized,
+        403 => error.Forbidden,
+        404 => error.NotFound,
+        429 => error.RateLimited,
+        else => error.HttpRequestFailed,
+    };
+}
+
+fn isRetryableFetchError(err: anyerror) bool {
+    return switch (err) {
+        error.ConnectionResetByPeer,
+        error.BrokenPipe,
+        error.NetworkUnreachable,
+        error.HostUnreachable,
+        error.ConnectionRefused,
+        error.ConnectionTimedOut,
+        error.TemporaryNameServerFailure,
+        error.NameServerFailure,
+        => true,
+        else => false,
+    };
+}
+
+fn resetHttpClient(self: *Client) void {
+    self.http.deinit();
+    self.http = .{ .allocator = self.allocator };
+}
 
 fn mockProducts(allocator: Allocator) ![]types.CiProduct {
     const items = try allocator.alloc(types.CiProduct, 2);
