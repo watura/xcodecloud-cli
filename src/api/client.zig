@@ -80,12 +80,36 @@ pub const Client = struct {
         return types.parseBuildRuns(self.allocator, body);
     }
 
-    pub fn createBuildRun(self: *Client, workflow_id: []const u8) !types.CiBuildRun {
+    pub fn getRepositoryForWorkflow(self: *Client, workflow_id: []const u8) ![]u8 {
+        if (self.credentials == null) return mockRepository(self.allocator);
+
+        const path = try endpoints.workflowById(self.allocator, workflow_id);
+        defer self.allocator.free(path);
+
+        const body = try self.requestJson(.GET, path, null);
+        defer self.allocator.free(body);
+
+        return types.parseRepositoryIdFromWorkflow(self.allocator, body);
+    }
+
+    pub fn listGitReferences(self: *Client, repository_id: []const u8) ![]types.ScmGitReference {
+        if (self.credentials == null) return mockGitReferences(self.allocator);
+
+        const path = try endpoints.gitReferencesForRepository(self.allocator, repository_id);
+        defer self.allocator.free(path);
+
+        const body = try self.requestJson(.GET, path, null);
+        defer self.allocator.free(body);
+
+        return types.parseGitReferences(self.allocator, body);
+    }
+
+    pub fn createBuildRun(self: *Client, workflow_id: []const u8, git_reference_id: ?[]const u8) !types.CiBuildRun {
         if (self.credentials == null) {
             return mockCreatedBuildRun(self.allocator, workflow_id);
         }
 
-        const payload = try endpoints.createBuildRunPayload(self.allocator, workflow_id);
+        const payload = try endpoints.createBuildRunPayload(self.allocator, workflow_id, git_reference_id);
         defer self.allocator.free(payload);
 
         const body = try self.requestJson(.POST, "/v1/ciBuildRuns", payload);
@@ -296,10 +320,18 @@ fn isRetryableStatus(status: std.http.Status) bool {
 
 fn mapHttpStatusToError(status: std.http.Status) anyerror {
     return switch (@intFromEnum(status)) {
-        401 => error.Unauthorized,
-        403 => error.Forbidden,
-        404 => error.NotFound,
-        429 => error.RateLimited,
+        400 => error.BadRequest_400,
+        401 => error.Unauthorized_401,
+        403 => error.Forbidden_403,
+        404 => error.NotFound_404,
+        405 => error.MethodNotAllowed_405,
+        409 => error.Conflict_409,
+        422 => error.UnprocessableEntity_422,
+        429 => error.RateLimited_429,
+        500 => error.InternalServerError_500,
+        502 => error.BadGateway_502,
+        503 => error.ServiceUnavailable_503,
+        504 => error.GatewayTimeout_504,
         else => error.HttpRequestFailed,
     };
 }
@@ -397,6 +429,38 @@ fn mockBuildRuns(allocator: Allocator, _: []const u8) ![]types.CiBuildRun {
         "2026-02-24T11:01:00Z",
         "-",
     );
+
+    return items;
+}
+
+fn mockRepository(allocator: Allocator) ![]u8 {
+    return allocator.dupe(u8, "repo-demo-1");
+}
+
+fn mockGitReferences(allocator: Allocator) ![]types.ScmGitReference {
+    const items = try allocator.alloc(types.ScmGitReference, 4);
+    errdefer allocator.free(items);
+
+    items[0] = .{
+        .id = try allocator.dupe(u8, "ref-main"),
+        .name = try allocator.dupe(u8, "main"),
+        .kind = try allocator.dupe(u8, "BRANCH"),
+    };
+    items[1] = .{
+        .id = try allocator.dupe(u8, "ref-develop"),
+        .name = try allocator.dupe(u8, "develop"),
+        .kind = try allocator.dupe(u8, "BRANCH"),
+    };
+    items[2] = .{
+        .id = try allocator.dupe(u8, "ref-feature"),
+        .name = try allocator.dupe(u8, "feature/new-ui"),
+        .kind = try allocator.dupe(u8, "BRANCH"),
+    };
+    items[3] = .{
+        .id = try allocator.dupe(u8, "ref-release"),
+        .name = try allocator.dupe(u8, "release/1.5"),
+        .kind = try allocator.dupe(u8, "BRANCH"),
+    };
 
     return items;
 }
@@ -649,11 +713,34 @@ fn isZipData(data: []const u8) bool {
 }
 
 fn normalizeViewerText(allocator: Allocator, content: []u8) ![]u8 {
-    if (std.unicode.utf8ValidateSlice(content)) {
-        return content;
+    if (!std.unicode.utf8ValidateSlice(content)) {
+        allocator.free(content);
+        return allocator.dupe(u8, "Artifact content is binary/non-UTF8. Use d:Download.");
+    }
+
+    // Normalize \r\n → \n and bare \r → \n so the viewer splits cleanly.
+    var out = try allocator.alloc(u8, content.len);
+    var j: usize = 0;
+    var i: usize = 0;
+    while (i < content.len) : (i += 1) {
+        if (content[i] == '\r') {
+            if (i + 1 < content.len and content[i + 1] == '\n') {
+                // \r\n → \n (skip the \r, the next iteration writes \n)
+                continue;
+            }
+            // bare \r → \n
+            out[j] = '\n';
+            j += 1;
+        } else {
+            out[j] = content[i];
+            j += 1;
+        }
     }
     allocator.free(content);
-    return allocator.dupe(u8, "Artifact content is binary/non-UTF8. Use d:Download.");
+    if (j < out.len) {
+        out = allocator.realloc(out, j) catch out;
+    }
+    return out[0..j];
 }
 
 fn termExitedZero(term: std.process.Child.Term) bool {

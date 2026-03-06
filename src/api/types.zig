@@ -41,6 +41,12 @@ pub const CiArtifact = struct {
     download_url: []u8,
 };
 
+pub const ScmGitReference = struct {
+    id: []u8,
+    name: []u8,
+    kind: []u8,
+};
+
 const AppRelationship = struct {
     data: ?struct {
         id: []const u8,
@@ -62,6 +68,15 @@ const IncludedRef = struct {
         name: ?[]const u8 = null,
     } = .{},
 };
+
+pub fn freeGitReferences(allocator: Allocator, items: []ScmGitReference) void {
+    for (items) |item| {
+        allocator.free(item.id);
+        allocator.free(item.name);
+        allocator.free(item.kind);
+    }
+    allocator.free(items);
+}
 
 pub fn freeProducts(allocator: Allocator, items: []CiProduct) void {
     for (items) |item| {
@@ -411,6 +426,90 @@ fn lookupIncludedRefName(
         }
     }
     return null;
+}
+
+pub fn parseRepositoryIdFromWorkflow(allocator: Allocator, json_body: []const u8) ![]u8 {
+    const IncludedItem = struct {
+        id: []const u8,
+        type: ?[]const u8 = null,
+    };
+
+    const Response = struct {
+        data: struct {
+            relationships: struct {
+                repository: ?struct {
+                    data: ?struct {
+                        id: []const u8,
+                    } = null,
+                } = null,
+            } = .{},
+        },
+        included: ?[]const IncludedItem = null,
+    };
+
+    var parsed = try std.json.parseFromSlice(Response, allocator, json_body, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    // Try relationships.repository.data.id first
+    if (parsed.value.data.relationships.repository) |repo_rel| {
+        if (repo_rel.data) |repo_data| {
+            return allocator.dupe(u8, repo_data.id);
+        }
+    }
+
+    // Fallback: find scmRepositories in included array
+    if (parsed.value.included) |included| {
+        for (included) |item| {
+            if (item.type) |t| {
+                if (std.mem.eql(u8, t, "scmRepositories")) {
+                    return allocator.dupe(u8, item.id);
+                }
+            }
+        }
+    }
+
+    return error.NotFound;
+}
+
+pub fn parseGitReferences(allocator: Allocator, json_body: []const u8) ![]ScmGitReference {
+    const Response = struct {
+        data: []const struct {
+            id: []const u8,
+            attributes: struct {
+                name: ?[]const u8 = null,
+                kind: ?[]const u8 = null,
+            } = .{},
+        },
+    };
+
+    var parsed = try std.json.parseFromSlice(Response, allocator, json_body, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    var list: std.ArrayListUnmanaged(ScmGitReference) = .empty;
+    errdefer {
+        for (list.items) |item| {
+            allocator.free(item.id);
+            allocator.free(item.name);
+            allocator.free(item.kind);
+        }
+        list.deinit(allocator);
+    }
+
+    for (parsed.value.data) |raw| {
+        const kind = raw.attributes.kind orelse "-";
+        if (!std.mem.eql(u8, kind, "BRANCH")) continue;
+        try list.append(allocator, .{
+            .id = try allocator.dupe(u8, raw.id),
+            .name = try dupOrDefault(allocator, raw.attributes.name, "(no name)"),
+            .kind = try allocator.dupe(u8, kind),
+        });
+    }
+
+    return list.toOwnedSlice(allocator);
 }
 
 test "parseArtifacts parses fields" {
