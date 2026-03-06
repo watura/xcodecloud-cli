@@ -36,7 +36,26 @@ pub fn artifactsForAction(allocator: Allocator, action_id: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "/v1/ciBuildActions/{s}/artifacts", .{action_id});
 }
 
-pub fn createBuildRunPayload(allocator: Allocator, workflow_id: []const u8) ![]u8 {
+pub fn workflowById(allocator: Allocator, workflow_id: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "/v1/ciWorkflows/{s}?include=repository", .{workflow_id});
+}
+
+pub fn gitReferencesForRepository(allocator: Allocator, repository_id: []const u8) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "/v1/scmRepositories/{s}/gitReferences?limit=200",
+        .{repository_id},
+    );
+}
+
+pub fn createBuildRunPayload(allocator: Allocator, workflow_id: []const u8, git_reference_id: ?[]const u8) ![]u8 {
+    if (git_reference_id) |ref_id| {
+        return std.fmt.allocPrint(
+            allocator,
+            "{{\"data\":{{\"type\":\"ciBuildRuns\",\"relationships\":{{\"workflow\":{{\"data\":{{\"type\":\"ciWorkflows\",\"id\":\"{s}\"}}}},\"sourceBranchOrTag\":{{\"data\":{{\"type\":\"scmGitReferences\",\"id\":\"{s}\"}}}}}}}}}}",
+            .{ workflow_id, ref_id },
+        );
+    }
     return std.fmt.allocPrint(
         allocator,
         "{{\"data\":{{\"type\":\"ciBuildRuns\",\"relationships\":{{\"workflow\":{{\"data\":{{\"type\":\"ciWorkflows\",\"id\":\"{s}\"}}}}}}}}}}",

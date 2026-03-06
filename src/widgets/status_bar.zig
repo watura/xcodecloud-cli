@@ -8,9 +8,13 @@ pub fn line(
     can_run: bool,
     can_download: bool,
     is_log_viewer: bool,
+    is_branch_select: bool,
 ) Allocator.Error![]u8 {
     if (is_log_viewer) {
         return allocator.dupe(u8, "j/k:Scroll  Ctrl+D/U:HalfPage  h/l:Horizontal  Esc/q:Back  Ctrl+C:Quit");
+    }
+    if (is_branch_select) {
+        return allocator.dupe(u8, "Type:Filter  ↑/↓:Move  Enter:Run Build  BS:Delete  Esc:Cancel  Ctrl+C:Quit");
     }
     if (can_go_back and can_download) {
         return allocator.dupe(u8, "j/k:Move  Enter:Open  d:Download  Esc/q:Back  R:Reload  Ctrl+C:Quit");

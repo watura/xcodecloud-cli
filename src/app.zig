@@ -9,6 +9,7 @@ const workflows_view = @import("views/workflows.zig");
 const build_runs_view = @import("views/build_runs.zig");
 const build_run_detail_view = @import("views/build_run_detail.zig");
 const build_action_artifacts_view = @import("views/build_action_artifacts.zig");
+const branch_select_view = @import("views/branch_select.zig");
 const status_bar = @import("widgets/status_bar.zig");
 
 const Allocator = std.mem.Allocator;
@@ -18,6 +19,7 @@ pub const Screen = enum {
     products,
     workflows,
     build_runs,
+    branch_select,
     build_run_detail,
     build_action_artifacts,
     log_viewer,
@@ -49,6 +51,12 @@ pub const App = struct {
     build_actions: []types.CiBuildAction = &.{},
     build_action_artifacts: []types.CiArtifact = &.{},
 
+    git_references: []types.ScmGitReference = &.{},
+    filtered_git_ref_indices: []usize = &.{},
+    selected_git_ref_index: usize = 0,
+    branch_filter_buf: [64]u8 = undefined,
+    branch_filter_len: usize = 0,
+
     selected_product_index: usize = 0,
     selected_workflow_index: usize = 0,
     selected_build_run_index: usize = 0,
@@ -59,6 +67,7 @@ pub const App = struct {
     log_artifact_name: []const u8 = "",
 
     status_message: ?[]u8 = null,
+    error_context: ?[]const u8 = null,
 
     pub fn init(allocator: Allocator, api: *api_client.Client) !App {
         var app = App{
@@ -94,6 +103,7 @@ pub const App = struct {
         self.clearProducts();
         self.clearWorkflows();
         self.clearBuildRuns();
+        self.clearGitReferences();
         self.clearBuildActions();
         self.clearBuildActionArtifacts();
         self.clearBuildRunDetail();
@@ -118,7 +128,10 @@ pub const App = struct {
     fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
         const self: *App = @ptrCast(@alignCast(ptr));
         self.handleEvent(ctx, event) catch |err| {
-            self.setStatusFmt("Error: {s}", .{@errorName(err)}) catch {};
+            const msg = self.error_context orelse "unknown operation";
+            self.setStatusFmt("Error in {s}: {s}", .{ msg, @errorName(err) }) catch {};
+            ctx.sendNotification("Error", self.status_message orelse @errorName(err)) catch {};
+            self.error_context = null;
             ctx.consumeAndRedraw();
         };
     }
@@ -155,6 +168,7 @@ pub const App = struct {
 
     fn pollScreenAndNotify(self: *App, ctx: *vxfw.EventContext) !void {
         switch (self.screen) {
+            .branch_select => {},
             .workflows => {
                 const changed = self.refreshWorkflowsIfChanged() catch |err| {
                     try self.setPollingFailedStatus(err);
@@ -185,6 +199,12 @@ pub const App = struct {
         if (key.matches('c', .{ .ctrl = true })) {
             ctx.quit = true;
             ctx.consumeEvent();
+            return;
+        }
+
+        // Branch select screen has its own key handling
+        if (self.screen == .branch_select) {
+            try self.handleBranchSelectKey(ctx, key);
             return;
         }
 
@@ -233,7 +253,7 @@ pub const App = struct {
         }
 
         if (key.matches('r', .{}) and self.screen == .build_runs) {
-            try self.triggerBuild();
+            try self.loadBranchSelect();
             ctx.consumeAndRedraw();
             return;
         }
@@ -281,10 +301,11 @@ pub const App = struct {
 
         const hints = try status_bar.line(
             ctx.arena,
-            self.screen != .products,
+            self.screen != .products and self.screen != .branch_select,
             self.screen == .build_runs,
             self.screen == .build_action_artifacts,
             self.screen == .log_viewer,
+            self.screen == .branch_select,
         );
 
         const title_text: vxfw.Text = .{
@@ -356,6 +377,13 @@ pub const App = struct {
                 self.selected_build_run_index = self.cursorIndex();
                 try self.loadBuildRunDetail();
             },
+            .branch_select => {
+                if (self.filtered_git_ref_indices.len == 0) return;
+                const cursor = self.cursorIndex();
+                if (cursor >= self.filtered_git_ref_indices.len) return;
+                self.selected_git_ref_index = self.filtered_git_ref_indices[cursor];
+                try self.triggerBuildWithBranch();
+            },
             .build_run_detail => {
                 if (self.build_actions.len == 0) return;
                 self.selected_build_action_index = self.cursorIndex();
@@ -379,6 +407,12 @@ pub const App = struct {
                 self.screen = .workflows;
                 try self.rebuildRows(self.selected_workflow_index);
             },
+            .branch_select => {
+                self.clearGitReferences();
+                self.branch_filter_len = 0;
+                self.screen = .build_runs;
+                try self.rebuildRows(self.selected_build_run_index);
+            },
             .build_run_detail => {
                 self.screen = .build_runs;
                 try self.rebuildRows(self.selected_build_run_index);
@@ -400,6 +434,7 @@ pub const App = struct {
             .products => try self.loadProducts(),
             .workflows => try self.loadWorkflows(),
             .build_runs => try self.loadBuildRuns(),
+            .branch_select => try self.loadBranchSelect(),
             .build_run_detail => try self.loadBuildRunDetail(),
             .build_action_artifacts => try self.loadBuildActionArtifacts(),
             .log_viewer => try self.loadLogContent(),
@@ -408,7 +443,9 @@ pub const App = struct {
 
     fn loadProducts(self: *App) !void {
         self.clearProducts();
+        self.error_context = "listProducts";
         self.products = try self.api.listProducts();
+        self.error_context = null;
         self.screen = .products;
 
         if (self.selected_product_index >= self.products.len) {
@@ -429,7 +466,9 @@ pub const App = struct {
         const product = self.products[self.selected_product_index];
 
         self.clearWorkflows();
+        self.error_context = "listWorkflows";
         self.workflows = try self.api.listWorkflows(product.id);
+        self.error_context = null;
         self.screen = .workflows;
 
         if (self.selected_workflow_index >= self.workflows.len) {
@@ -473,7 +512,9 @@ pub const App = struct {
         const workflow = self.workflows[self.selected_workflow_index];
 
         self.clearBuildRuns();
+        self.error_context = "listBuildRuns";
         self.build_runs = try self.api.listBuildRuns(workflow.id);
+        self.error_context = null;
         std.mem.sort(types.CiBuildRun, self.build_runs, {}, lessThanBuildRunNewestFirst);
         self.screen = .build_runs;
 
@@ -539,8 +580,11 @@ pub const App = struct {
         self.clearBuildActions();
         self.clearBuildActionArtifacts();
 
+        self.error_context = "getBuildRun";
         self.build_run_detail = try self.api.getBuildRun(run.id);
+        self.error_context = "listBuildActions";
         self.build_actions = try self.api.listBuildActions(run.id);
+        self.error_context = null;
         self.screen = .build_run_detail;
 
         try self.rebuildRows(0);
@@ -557,7 +601,9 @@ pub const App = struct {
         const action = self.build_actions[self.selected_build_action_index];
 
         self.clearBuildActionArtifacts();
+        self.error_context = "listArtifactsForAction";
         self.build_action_artifacts = try self.api.listArtifactsForAction(action.id);
+        self.error_context = null;
         self.screen = .build_action_artifacts;
         if (self.selected_artifact_index >= self.build_action_artifacts.len) {
             self.selected_artifact_index = 0;
@@ -644,16 +690,114 @@ pub const App = struct {
         try self.setStatusFmt("Opened URL: {s}", .{artifact.download_url});
     }
 
-    fn triggerBuild(self: *App) !void {
-        if (self.screen != .build_runs or self.workflows.len == 0) return;
+    fn handleBranchSelectKey(self: *App, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
+        if (key.matches(vaxis.Key.escape, .{})) {
+            try self.goBack();
+            ctx.consumeAndRedraw();
+            return;
+        }
+
+        if (key.matches(vaxis.Key.enter, .{})) {
+            if (self.filtered_git_ref_indices.len == 0) {
+                ctx.consumeEvent();
+                return;
+            }
+            try self.activateSelection();
+            ctx.consumeAndRedraw();
+            return;
+        }
+
+        if (key.matches(vaxis.Key.down, .{}) or key.matches('n', .{ .ctrl = true })) {
+            self.list_view.nextItem(ctx);
+            return;
+        }
+
+        if (key.matches(vaxis.Key.up, .{}) or key.matches('p', .{ .ctrl = true })) {
+            self.list_view.prevItem(ctx);
+            return;
+        }
+
+        if (key.matches(vaxis.Key.backspace, .{})) {
+            if (self.branch_filter_len > 0) {
+                self.branch_filter_len -= 1;
+                try self.rebuildRows(0);
+                ctx.consumeAndRedraw();
+            } else {
+                ctx.consumeEvent();
+            }
+            return;
+        }
+
+        // Printable character → append to filter
+        if (key.text) |text| {
+            if (text.len > 0 and text[0] >= 0x20) {
+                for (text) |ch| {
+                    if (self.branch_filter_len < self.branch_filter_buf.len) {
+                        self.branch_filter_buf[self.branch_filter_len] = ch;
+                        self.branch_filter_len += 1;
+                    }
+                }
+                try self.rebuildRows(0);
+                ctx.consumeAndRedraw();
+                return;
+            }
+        } else if (key.codepoint >= 0x20 and key.codepoint < 0x7f and key.mods.ctrl == false and key.mods.alt == false and key.mods.super == false) {
+            if (self.branch_filter_len < self.branch_filter_buf.len) {
+                self.branch_filter_buf[self.branch_filter_len] = @intCast(key.codepoint);
+                self.branch_filter_len += 1;
+            }
+            try self.rebuildRows(0);
+            ctx.consumeAndRedraw();
+            return;
+        }
+
+        ctx.consumeEvent();
+    }
+
+    fn loadBranchSelect(self: *App) !void {
+        if (self.workflows.len == 0) {
+            try self.setStatus("No workflows available");
+            return;
+        }
 
         self.selected_workflow_index = @min(self.selected_workflow_index, self.workflows.len - 1);
         const workflow = self.workflows[self.selected_workflow_index];
 
-        const created = try self.api.createBuildRun(workflow.id);
-        defer types.freeBuildRun(self.allocator, created);
+        self.error_context = "getRepositoryForWorkflow";
+        const repo_id = try self.api.getRepositoryForWorkflow(workflow.id);
+        defer self.allocator.free(repo_id);
 
-        try self.setStatusFmt("Triggered build run #{s}", .{created.number});
+        self.clearGitReferences();
+        self.error_context = "listGitReferences";
+        self.git_references = try self.api.listGitReferences(repo_id);
+        self.error_context = null;
+        self.screen = .branch_select;
+        self.selected_git_ref_index = 0;
+        self.branch_filter_len = 0;
+
+        try self.rebuildRows(0);
+        try self.setStatusFmt("Select a branch to build ({d} branches)", .{self.git_references.len});
+    }
+
+    fn triggerBuildWithBranch(self: *App) !void {
+        if (self.workflows.len == 0 or self.git_references.len == 0) return;
+
+        self.selected_workflow_index = @min(self.selected_workflow_index, self.workflows.len - 1);
+        const workflow = self.workflows[self.selected_workflow_index];
+
+        self.selected_git_ref_index = @min(self.selected_git_ref_index, self.git_references.len - 1);
+        const git_ref = self.git_references[self.selected_git_ref_index];
+
+        self.error_context = "createBuildRun";
+        const created = try self.api.createBuildRun(workflow.id, git_ref.id);
+        defer types.freeBuildRun(self.allocator, created);
+        self.error_context = null;
+
+        try self.setStatusFmt("Triggered build run #{s} on branch {s}", .{ created.number, git_ref.name });
+
+        self.clearGitReferences();
+        self.branch_filter_len = 0;
+        self.screen = .build_runs;
         try self.loadBuildRuns();
     }
 
@@ -694,6 +838,33 @@ pub const App = struct {
                 for (self.build_runs, 0..) |item, idx| {
                     const line = try build_runs_view.row(arena, item);
                     self.row_entries[idx] = makeRowEntry(line);
+                }
+            },
+            .branch_select => {
+                const workflow_name = if (self.workflows.len == 0) "-" else self.workflows[self.selected_workflow_index].name;
+                self.title_line = try std.fmt.allocPrint(arena, "Select Branch for {s}", .{workflow_name});
+                self.header_line = try branch_select_view.header(arena);
+
+                // Build filtered indices
+                const filter_str = self.branch_filter_buf[0..self.branch_filter_len];
+                var indices: std.ArrayListUnmanaged(usize) = .empty;
+                for (self.git_references, 0..) |item, idx| {
+                    if (filter_str.len == 0 or fuzzyMatch(item.name, filter_str)) {
+                        try indices.append(arena, idx);
+                    }
+                }
+                self.filtered_git_ref_indices = try indices.toOwnedSlice(arena);
+
+                if (filter_str.len > 0) {
+                    self.detail_summary = try std.fmt.allocPrint(arena, "Filter: {s}  ({d}/{d} branches)", .{ filter_str, self.filtered_git_ref_indices.len, self.git_references.len });
+                } else {
+                    self.detail_summary = try std.fmt.allocPrint(arena, "Filter: (type to search)  ({d} branches)", .{self.git_references.len});
+                }
+
+                self.row_entries = try arena.alloc(RowEntry, self.filtered_git_ref_indices.len);
+                for (self.filtered_git_ref_indices, 0..) |ref_idx, i| {
+                    const line_str = try branch_select_view.row(arena, self.git_references[ref_idx]);
+                    self.row_entries[i] = makeRowEntry(line_str);
                 }
             },
             .build_run_detail => {
@@ -786,6 +957,7 @@ pub const App = struct {
             .products => std.fmt.allocPrint(allocator, "Xcode Cloud > {s}", .{self.titleLine()}),
             .workflows => std.fmt.allocPrint(allocator, "Xcode Cloud > Products > {s}", .{self.titleLine()}),
             .build_runs => std.fmt.allocPrint(allocator, "Xcode Cloud > Products > Workflows > {s}", .{self.titleLine()}),
+            .branch_select => std.fmt.allocPrint(allocator, "Xcode Cloud > Products > Workflows > Build Runs > {s}", .{self.titleLine()}),
             .build_run_detail => std.fmt.allocPrint(allocator, "Xcode Cloud > Products > Workflows > Build Runs > Detail", .{}),
             .build_action_artifacts => std.fmt.allocPrint(allocator, "Xcode Cloud > Products > Workflows > Build Runs > Detail > Artifacts", .{}),
             .log_viewer => std.fmt.allocPrint(allocator, "Xcode Cloud > Products > Workflows > Build Runs > Detail > Artifacts > Log Viewer", .{}),
@@ -798,6 +970,7 @@ pub const App = struct {
             .products => "Products",
             .workflows => "Workflows",
             .build_runs => "Build Runs",
+            .branch_select => "Select Branch",
             .build_run_detail => "Build Run Detail",
             .build_action_artifacts => "Build Action Artifacts",
             .log_viewer => "Log Viewer",
@@ -825,18 +998,18 @@ pub const App = struct {
 
     fn setPollingFailedStatus(self: *App, err: anyerror) !void {
         const detail = switch (err) {
-            error.RateLimited => "RateLimited (429)",
-            error.Unauthorized => "Unauthorized (401)",
-            error.Forbidden => "Forbidden (403)",
-            error.NotFound => "NotFound (404)",
+            error.RateLimited_429 => "RateLimited (429)",
+            error.Unauthorized_401 => "Unauthorized (401)",
+            error.Forbidden_403 => "Forbidden (403)",
+            error.NotFound_404 => "NotFound (404)",
             else => @errorName(err),
         };
 
         const hint = switch (err) {
-            error.RateLimited => " - API rate limit reached",
-            error.Unauthorized => " - check API key/issuer and system clock",
-            error.Forbidden => " - check App Store Connect role/permissions",
-            error.NotFound => " - target resource may have been deleted",
+            error.RateLimited_429 => " - API rate limit reached",
+            error.Unauthorized_401 => " - check API key/issuer and system clock",
+            error.Forbidden_403 => " - check App Store Connect role/permissions",
+            error.NotFound_404 => " - target resource may have been deleted",
             else => "",
         };
 
@@ -879,6 +1052,13 @@ pub const App = struct {
         if (self.workflows.len > 0) {
             types.freeWorkflows(self.allocator, self.workflows);
             self.workflows = &.{};
+        }
+    }
+
+    fn clearGitReferences(self: *App) void {
+        if (self.git_references.len > 0) {
+            types.freeGitReferences(self.allocator, self.git_references);
+            self.git_references = &.{};
         }
     }
 
@@ -949,4 +1129,21 @@ fn buildRunsEqual(a: []const types.CiBuildRun, b: []const types.CiBuildRun) bool
 
 fn isLogArtifactType(file_type: []const u8) bool {
     return std.mem.eql(u8, file_type, "LOG") or std.mem.eql(u8, file_type, "LOG_BUNDLE");
+}
+
+/// Fuzzy match: all characters in pattern appear in haystack in order (case-insensitive).
+fn fuzzyMatch(haystack: []const u8, pattern: []const u8) bool {
+    var hi: usize = 0;
+    for (pattern) |pc| {
+        const lc = std.ascii.toLower(pc);
+        while (hi < haystack.len) : (hi += 1) {
+            if (std.ascii.toLower(haystack[hi]) == lc) {
+                hi += 1;
+                break;
+            }
+        } else {
+            return false;
+        }
+    }
+    return true;
 }
