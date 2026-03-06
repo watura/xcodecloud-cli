@@ -713,11 +713,34 @@ fn isZipData(data: []const u8) bool {
 }
 
 fn normalizeViewerText(allocator: Allocator, content: []u8) ![]u8 {
-    if (std.unicode.utf8ValidateSlice(content)) {
-        return content;
+    if (!std.unicode.utf8ValidateSlice(content)) {
+        allocator.free(content);
+        return allocator.dupe(u8, "Artifact content is binary/non-UTF8. Use d:Download.");
+    }
+
+    // Normalize \r\n → \n and bare \r → \n so the viewer splits cleanly.
+    var out = try allocator.alloc(u8, content.len);
+    var j: usize = 0;
+    var i: usize = 0;
+    while (i < content.len) : (i += 1) {
+        if (content[i] == '\r') {
+            if (i + 1 < content.len and content[i + 1] == '\n') {
+                // \r\n → \n (skip the \r, the next iteration writes \n)
+                continue;
+            }
+            // bare \r → \n
+            out[j] = '\n';
+            j += 1;
+        } else {
+            out[j] = content[i];
+            j += 1;
+        }
     }
     allocator.free(content);
-    return allocator.dupe(u8, "Artifact content is binary/non-UTF8. Use d:Download.");
+    if (j < out.len) {
+        out = allocator.realloc(out, j) catch out;
+    }
+    return out[0..j];
 }
 
 fn termExitedZero(term: std.process.Child.Term) bool {

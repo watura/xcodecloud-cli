@@ -156,6 +156,7 @@ pub const App = struct {
             .mouse => |mouse| {
                 if (self.screen == .log_viewer) {
                     try self.log_scroll_view.handleEvent(ctx, .{ .mouse = mouse });
+                    try ctx.queueRefresh();
                 }
             },
             else => {},
@@ -210,12 +211,14 @@ pub const App = struct {
 
         if (key.matches('R', .{}) or key.matches('r', .{ .shift = true })) {
             try self.reloadCurrentScreen();
+            try ctx.queueRefresh();
             ctx.consumeAndRedraw();
             return;
         }
 
         if (key.matches(vaxis.Key.escape, .{})) {
             try self.goBack();
+            try ctx.queueRefresh();
             ctx.consumeAndRedraw();
             return;
         }
@@ -228,6 +231,7 @@ pub const App = struct {
             }
 
             try self.goBack();
+            try ctx.queueRefresh();
             ctx.consumeAndRedraw();
             return;
         }
@@ -238,6 +242,7 @@ pub const App = struct {
                 return;
             }
             try self.activateSelection();
+            try ctx.queueRefresh();
             ctx.consumeAndRedraw();
             return;
         }
@@ -268,6 +273,7 @@ pub const App = struct {
             if (key.matches(vaxis.Key.page_down, .{})) {
                 const scroll_lines: u8 = 20;
                 if (self.log_scroll_view.scroll.linesDown(scroll_lines)) {
+                    try ctx.queueRefresh();
                     ctx.consumeAndRedraw();
                 } else {
                     ctx.consumeEvent();
@@ -277,6 +283,7 @@ pub const App = struct {
             if (key.matches(vaxis.Key.page_up, .{})) {
                 const scroll_lines: u8 = 20;
                 if (self.log_scroll_view.scroll.linesUp(scroll_lines)) {
+                    try ctx.queueRefresh();
                     ctx.consumeAndRedraw();
                 } else {
                     ctx.consumeEvent();
@@ -285,6 +292,7 @@ pub const App = struct {
             }
 
             try self.log_scroll_view.handleEvent(ctx, .{ .key_press = key });
+            try ctx.queueRefresh();
             return;
         }
     }
@@ -909,7 +917,9 @@ pub const App = struct {
                         var it = std.mem.splitScalar(u8, content, '\n');
                         var idx: usize = 0;
                         while (it.next()) |line| : (idx += 1) {
-                            self.row_entries[idx] = makeRowEntry(line);
+                            // Empty lines produce 0-height surfaces in the ScrollView,
+                            // causing subsequent lines to overlap. Use a space instead.
+                            self.row_entries[idx] = makeRowEntry(if (line.len == 0) " " else line);
                         }
                     }
                 } else {
