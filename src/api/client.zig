@@ -338,14 +338,20 @@ fn mapHttpStatusToError(status: std.http.Status) anyerror {
 
 fn isRetryableFetchError(err: anyerror) bool {
     return switch (err) {
+        error.HttpConnectionClosing,
+        error.HttpRequestTruncated,
+        error.ReadFailed,
         error.ConnectionResetByPeer,
         error.BrokenPipe,
         error.NetworkUnreachable,
         error.HostUnreachable,
         error.ConnectionRefused,
         error.ConnectionTimedOut,
+        error.SocketNotConnected,
+        error.NotOpenForReading,
         error.TemporaryNameServerFailure,
         error.NameServerFailure,
+        error.TlsConnectionTruncated,
         => true,
         else => false,
     };
@@ -766,4 +772,14 @@ fn sanitizeFileNameAlloc(allocator: Allocator, raw: []const u8) ![]u8 {
         try out.appendSlice(allocator, "artifact.bin");
     }
     return out.toOwnedSlice(allocator);
+}
+
+test "isRetryableFetchError treats keep-alive closure as retryable" {
+    try std.testing.expect(isRetryableFetchError(error.HttpConnectionClosing));
+    try std.testing.expect(isRetryableFetchError(error.ReadFailed));
+    try std.testing.expect(isRetryableFetchError(error.TlsConnectionTruncated));
+}
+
+test "isRetryableFetchError rejects non-transient errors" {
+    try std.testing.expect(!isRetryableFetchError(error.Unauthorized_401));
 }
